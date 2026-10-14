@@ -1,0 +1,13 @@
+# 构建产物
+/target
+
+# 运行数据与本地产物：app/data/state.json 里是明文 API Key，绝不能提交
+/app
+/data
+
+# 本地工具状态
+/.workbuddy-ai
+
+# 编辑器
+.idea
+.vscode

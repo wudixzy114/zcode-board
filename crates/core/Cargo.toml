@@ -1,0 +1,25 @@
+[package]
+name = "zcode-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "zcode 看板核心逻辑：额度探测、账户归组、调度刷新与提醒"
+
+[dependencies]
+zcode-model = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+base64 = "0.22"
+notify-rust = "4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+] }

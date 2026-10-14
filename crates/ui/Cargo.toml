@@ -1,0 +1,32 @@
+[package]
+name = "zcode-board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "zcode（Z.ai / GLM Coding Plan）API 账号额度可视化与自动提醒桌面工具"
+
+[[bin]]
+name = "zcode-board"
+path = "src/main.rs"
+
+[dependencies]
+zcode-model = { workspace = true }
+zcode-core = { workspace = true }
+
+eframe = "0.32"
+egui = "0.32"
+# 仅为从 eframe::Frame 取 Win32 HWND（托盘恢复/隐藏窗口的直调路径）
+raw-window-handle = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
