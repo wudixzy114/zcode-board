@@ -48,15 +48,16 @@ pub enum TrayCmd {
     Shutdown,
 }
 
-/// 托盘图标状态。
+/// 托盘图标档位（决定闪电颜色），由启用通知的 plan 用量聚合而来，
+/// 见 `app.rs` 的 `aggregate_status`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayStatus {
-    /// 一切正常（绿色闪电）。
-    Ok,
-    /// 有待处理但不算错误的条目（黄色闪电）。
-    Idle,
-    /// 存在异常 key（红色闪电）。
-    Error,
+    /// 绿色闪电：启用通知的 plan 里至少一个用量低于告警线。
+    Green,
+    /// 黄色闪电：没有绿档，但至少一个落在 60%–85% 告警区间。
+    Yellow,
+    /// 红色闪电：没有绿/黄档——全红、无数据，或没有启用通知的 plan。
+    Red,
 }
 
 /// 托盘句柄。界面线程持有，用来下发命令与接收事件。
@@ -166,9 +167,9 @@ impl Drop for Tray {
 
 /// 状态配色，顺序与 `status_index` 对应。
 const STATUS_COLORS: [(TrayStatus, [u8; 3]); 3] = [
-    (TrayStatus::Ok, [76, 209, 138]),
-    (TrayStatus::Idle, [235, 182, 74]),
-    (TrayStatus::Error, [235, 87, 100]),
+    (TrayStatus::Green, [76, 209, 138]),
+    (TrayStatus::Yellow, [235, 182, 74]),
+    (TrayStatus::Red, [235, 87, 100]),
 ];
 
 /// 图标边长（32，和下面的放大倍数对应）。
@@ -177,9 +178,9 @@ pub const ICON_SIZE: u32 = 32;
 #[cfg_attr(not(windows), allow(dead_code))]
 fn status_index(status: TrayStatus) -> usize {
     match status {
-        TrayStatus::Ok => 0,
-        TrayStatus::Idle => 1,
-        TrayStatus::Error => 2,
+        TrayStatus::Green => 0,
+        TrayStatus::Yellow => 1,
+        TrayStatus::Red => 2,
     }
 }
 
@@ -245,13 +246,13 @@ pub fn icon_rgba(status: TrayStatus) -> Vec<u8> {
 #[cfg(windows)]
 mod win {
     use super::{ICON_SIZE, TrayCmd, TrayEvent, TrayStatus, icon_rgba, status_index};
+    use std::cell::Cell;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::Receiver;
-    use std::cell::Cell;
     use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
-        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
         DeleteObject,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -261,13 +262,13 @@ mod win {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-        DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, HICON, ICONINFO,
-        ICON_BIG, ICON_SMALL, IDC_ARROW, IsIconic, LoadCursorW, MF_STRING, MSG,
-        MsgWaitForMultipleObjectsEx, PeekMessageW, PM_REMOVE, PostMessageW, PostQuitMessage,
-        QS_ALLINPUT, RegisterClassExW, SetForegroundWindow, SW_RESTORE, SW_SHOW, ShowWindow,
-        TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WNDCLASSEXW, WM_APP,
-        WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-        WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETICON, WS_OVERLAPPED,
+        DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, HICON, ICON_BIG,
+        ICON_SMALL, ICONINFO, IDC_ARROW, IsIconic, LoadCursorW, MF_STRING, MSG,
+        MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage,
+        QS_ALLINPUT, RegisterClassExW, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND,
+        WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_QUIT,
+        WM_RBUTTONUP, WM_SETICON, WNDCLASSEXW, WS_OVERLAPPED,
     };
 
     /// 线程内共享的托盘状态（窗口过程通过 TLS 访问）。
@@ -316,7 +317,11 @@ mod win {
             if hwnd.is_null() {
                 return;
             }
-            let cmd = if IsIconic(hwnd) != 0 { SW_RESTORE } else { SW_SHOW };
+            let cmd = if IsIconic(hwnd) != 0 {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            };
             ShowWindow(hwnd, cmd);
             SetForegroundWindow(hwnd);
         }
@@ -586,11 +591,11 @@ mod win {
             let state = Box::into_raw(Box::new(TrayState {
                 events,
                 icons: [
-                    make_icon(&icon_rgba(TrayStatus::Ok), ICON_SIZE),
-                    make_icon(&icon_rgba(TrayStatus::Idle), ICON_SIZE),
-                    make_icon(&icon_rgba(TrayStatus::Error), ICON_SIZE),
+                    make_icon(&icon_rgba(TrayStatus::Green), ICON_SIZE),
+                    make_icon(&icon_rgba(TrayStatus::Yellow), ICON_SIZE),
+                    make_icon(&icon_rgba(TrayStatus::Red), ICON_SIZE),
                 ],
-                status: TrayStatus::Idle,
+                status: TrayStatus::Yellow,
                 tip: initial_tip,
                 added: false,
                 icon_ok,
@@ -679,13 +684,7 @@ mod win {
                 }
 
                 // 等消息或超时（超时用于重新检查命令队列）。
-                MsgWaitForMultipleObjectsEx(
-                    0,
-                    std::ptr::null(),
-                    200,
-                    QS_ALLINPUT,
-                    0,
-                );
+                MsgWaitForMultipleObjectsEx(0, std::ptr::null(), 200, QS_ALLINPUT, 0);
 
                 let mut msg: MSG = std::mem::zeroed();
                 while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
@@ -764,9 +763,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowExW, GetWindowThreadProcessId,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
 
     /// 按类名找**本进程**的托盘隐藏顶层窗口。
     ///
@@ -795,12 +792,7 @@ mod tests {
                     found = hwnd;
                     break;
                 }
-                hwnd = FindWindowExW(
-                    std::ptr::null_mut(),
-                    hwnd,
-                    class.as_ptr(),
-                    std::ptr::null(),
-                );
+                hwnd = FindWindowExW(std::ptr::null_mut(), hwnd, class.as_ptr(), std::ptr::null());
             }
         }
         found
@@ -835,8 +827,8 @@ mod tests {
 
         // 命令通道：更新提示与状态不应 panic。
         tray.set_tip("zcode 额度看板 · 5 个 key");
-        tray.set_status(TrayStatus::Error);
-        tray.set_status(TrayStatus::Ok);
+        tray.set_status(TrayStatus::Red);
+        tray.set_status(TrayStatus::Green);
         assert_eq!(tray.drain_events().len(), 0, "无用户操作时不应有事件");
 
         // 关闭后窗口应销毁。
@@ -849,7 +841,7 @@ mod tests {
 
     #[test]
     fn icon_pixels_bolt() {
-        let rgba = icon_rgba(TrayStatus::Ok);
+        let rgba = icon_rgba(TrayStatus::Green);
         assert_eq!(rgba.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
         // 中心点（闪电躯干内部）应点亮为绿色，角落应为透明；
         // 内部像素覆盖率为 100%，alpha 应是实打实的 255。
@@ -858,14 +850,12 @@ mod tests {
         assert_eq!(
             [rgba[center], rgba[center + 1], rgba[center + 2]],
             [76, 209, 138],
-            "中心应为 Ok 状态的绿色"
+            "中心应为 Green 档的绿色"
         );
         assert_eq!(rgba[3], 0, "角落应透明");
-        assert_eq!(icon_rgba(TrayStatus::Error)[center + 1], 87, "Error 图标为红色");
+        assert_eq!(icon_rgba(TrayStatus::Red)[center + 1], 87, "Red 图标为红色");
         // 抗锯齿：边缘上应存在 0 < alpha < 255 的过渡像素。
-        let has_soft_edge = rgba
-            .chunks_exact(4)
-            .any(|px| px[3] > 0 && px[3] < 255);
+        let has_soft_edge = rgba.chunks_exact(4).any(|px| px[3] > 0 && px[3] < 255);
         assert!(has_soft_edge, "超采样光栅化应产生平滑的边缘过渡");
     }
 }

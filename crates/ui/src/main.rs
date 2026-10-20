@@ -64,13 +64,13 @@ fn main() -> eframe::Result<()> {
             .with_title("zcode 额度看板")
             .with_inner_size(vec2(1150.0, 780.0))
             .with_min_inner_size(vec2(880.0, 560.0))
-        .with_icon(Arc::new(IconData {
-            // 启动先给绿色：首帧 sync_tray 会按实际状态换色
-            // （任务栏/标题栏与托盘图标保持一致）。
-            rgba: tray::icon_rgba(tray::TrayStatus::Ok),
-            width: tray::ICON_SIZE,
-            height: tray::ICON_SIZE,
-        })),
+            .with_icon(Arc::new(IconData {
+                // 启动先给绿色：首帧 sync_tray 会按实际档位换色
+                // （任务栏/标题栏与托盘图标保持一致）。
+                rgba: tray::icon_rgba(tray::TrayStatus::Green),
+                width: tray::ICON_SIZE,
+                height: tray::ICON_SIZE,
+            })),
         ..Default::default()
     };
 

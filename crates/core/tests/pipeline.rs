@@ -106,6 +106,7 @@ fn settings_for(base: &str) -> Settings {
         extra_headers: String::new(),
         start_with_windows: false,
         minimize_to_tray: false,
+        rate_span_secs: 3600,
     }
 }
 
@@ -587,8 +588,7 @@ async fn cleanup_stale_only_removes_vanished_scan_keys() {
     .await;
 
     // 本机现在只剩 id1.secret1：id2.secret2 属于「已失效」。
-    let live: std::collections::HashSet<String> =
-        ["id1.secret1".to_string()].into_iter().collect();
+    let live: std::collections::HashSet<String> = ["id1.secret1".to_string()].into_iter().collect();
     let removed = manager.cleanup_stale(&live).await;
     assert_eq!(removed, 1, "只应清掉本机已不存在的那个同步 key");
 
@@ -600,7 +600,10 @@ async fn cleanup_stale_only_removes_vanished_scan_keys() {
         .map(|k| k.secret.as_str())
         .collect();
     assert!(secrets.contains(&"manual.secret"), "手动 key 不应被清理");
-    assert!(secrets.contains(&"id1.secret1"), "仍在用的同步 key 不应被清理");
+    assert!(
+        secrets.contains(&"id1.secret1"),
+        "仍在用的同步 key 不应被清理"
+    );
     assert!(!secrets.contains(&"id2.secret2"), "失效的同步 key 应被清掉");
     // 失效 key 所在的账户应被回收，不留下空卡片。
     assert!(
@@ -635,7 +638,11 @@ async fn stale_state_file_is_migrated_on_load() {
         ],
         "settings": Settings::default()
     });
-    std::fs::write(dir.join("state.json"), serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
 
     let _manager = Manager::new(&dir).await;
     // 迁移发生在落库前：直接读回文件断言（视图要等刷新归组后才显示 key）。
@@ -645,7 +652,9 @@ async fn stale_state_file_is_migrated_on_load() {
     let secrets: Vec<&str> = keys.iter().map(|k| k["secret"].as_str().unwrap()).collect();
 
     assert!(
-        !secrets.iter().any(|s| s.starts_with("jwt-") || s.starts_with("oauth-") || s.starts_with("cfg-")),
+        !secrets
+            .iter()
+            .any(|s| s.starts_with("jwt-") || s.starts_with("oauth-") || s.starts_with("cfg-")),
         "废弃来源的残留 key 应被迁移清掉，实际: {secrets:?}"
     );
     assert_eq!(
@@ -656,14 +665,177 @@ async fn stale_state_file_is_migrated_on_load() {
     assert!(secrets.contains(&"manual-a"), "手动添加的 key 必须保留");
 
     let accounts = persisted["accounts"].as_array().unwrap();
-    let names: Vec<&str> = accounts.iter().map(|a| a["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = accounts
+        .iter()
+        .map(|a| a["name"].as_str().unwrap())
+        .collect();
     assert!(
-        accounts.iter().all(|a| !a["id"].as_str().unwrap().is_empty()),
+        accounts
+            .iter()
+            .all(|a| !a["id"].as_str().unwrap().is_empty()),
         "空账户（幽灵卡片）应被清掉，实际: {names:?}"
     );
     assert!(
         !names.contains(&"zcode-jwt"),
         "废弃来源的账户应被清掉，实际: {names:?}"
     );
-    assert!(!names.contains(&"bigmodel"), "空账户应被清掉，实际: {names:?}");
+    assert!(
+        !names.contains(&"bigmodel"),
+        "空账户应被清掉，实际: {names:?}"
+    );
+}
+
+// ─────────────────────── 速率：采样 → 曲线 → 持久化 ───────────────────────
+
+/// 每次请求用量都递增的假上游：模拟真实消耗，让速率差分有非零信号。
+async fn spawn_growing_upstream() -> String {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let counter = Arc::new(AtomicI64::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                continue;
+            };
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let Ok(read) = socket.read(&mut buf).await else {
+                    return;
+                };
+                let _ = String::from_utf8_lossy(&buf[..read]);
+
+                // 第 n 次请求：月度调用窗口已用 n*300（数值 + 百分比都有）；
+                // 5 小时 Token 窗口复刻真实上游——只有百分比、没有数值用量。
+                let used = n * 300;
+                let now = zcode_core::util::now_ms();
+                let body = format!(
+                    r#"{{"success":true,"msg":"","data":{{"limits":[
+                        {{"type":"TIME_LIMIT","unit":5,"number":1,"usage":100000,"currentValue":{used},"remaining":{},"percentage":{},"nextResetTime":{}}},
+                        {{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":{},"nextResetTime":{}}}
+                    ]}}}}"#,
+                    100_000 - used,
+                    used * 100 / 100_000,
+                    now + 29 * 24 * 3_600_000,
+                    40 + n,
+                    now + 5 * 3_600_000
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+#[tokio::test]
+async fn rate_accumlates_across_refreshes_and_survives_restart() {
+    let base = spawn_growing_upstream().await;
+    let dir = test_dir("rate");
+
+    {
+        let manager = Manager::new(&dir).await;
+        manager.update_settings(settings_for(&base)).await;
+        manager
+            .add_keys(&AddKeyRequest {
+                secrets: "id1.secret1".to_string(),
+                label: None,
+            })
+            .await;
+
+        // 第一次刷新：有窗口但还没有速率（只有 1 个采样点）。
+        wait_until(&manager, |view| {
+            view.accounts
+                .first()
+                .is_some_and(|a| a.windows.iter().any(|w| w.used.is_some()))
+        })
+        .await;
+        let view = manager.view().await;
+        assert!(
+            view.accounts[0].windows.iter().all(|w| w.rate.is_none()),
+            "单个采样点不应有速率"
+        );
+
+        // 间隔超过最小可分辨间隔（5 秒）再刷一次：差分成立，速率出现。
+        tokio::time::sleep(Duration::from_millis(5_500)).await;
+        let ids = manager.all_key_ids().await;
+        manager.run_refresh(ids, 2).await;
+
+        wait_until(&manager, |view| {
+            view.accounts
+                .first()
+                .is_some_and(|a| a.windows.iter().any(|w| w.rate.is_some()))
+        })
+        .await;
+
+        let view = manager.view().await;
+        let windows = &view.accounts[0].windows;
+
+        // 月度调用窗口：数值序列 → 次/min，量级 ~3000/min。
+        let monthly = windows
+            .iter()
+            .find(|w| w.kind == "TIME_LIMIT")
+            .expect("应有月度调用窗口");
+        let rate = monthly.rate.as_ref().expect("月度窗口应有速率");
+        assert_eq!(rate.unit, "次/min");
+        assert!(!rate.percent_based);
+        assert!(!rate.points.is_empty(), "两次采样至少产出一个速率点");
+        // 两次请求相隔 ~5.5s、用量差 300 → 速率约 3000/min，放宽到 > 1000 防计时抖动。
+        assert!(
+            rate.points.iter().all(|p| p.per_min > 1000.0),
+            "速率点应为正且量级正确: {:?}",
+            rate.points
+        );
+
+        // 5 小时 Token 窗口：上游只给百分比 → 百分比差分序列，单位 %/h。
+        let five_hour = windows
+            .iter()
+            .find(|w| w.kind == "TOKENS_LIMIT")
+            .expect("应有 5 小时 Token 窗口");
+        let rate = five_hour.rate.as_ref().expect("5 小时窗口也应有速率");
+        assert_eq!(rate.unit, "%/h");
+        assert!(rate.percent_based, "无数值用量的窗口应走百分比序列");
+        assert!(
+            !rate.points.is_empty(),
+            "百分比序列两次采样也应产出速率点: {:?}",
+            rate.points
+        );
+
+        // 强制落盘（正常路径有 60 秒节流），给重启续存断言用。
+        manager.persist_history_now().await;
+    }
+
+    // 重启：历史从 history.json 读回。窗口视图要等第一次刷新重建
+    // （窗口来自内存 runtime），刷一次后速率曲线应带着旧点回来。
+    let manager = Manager::new(&dir).await;
+    manager.update_settings(settings_for(&base)).await;
+    let ids = manager.all_key_ids().await;
+    manager.run_refresh(ids, 2).await;
+    wait_until(&manager, |view| {
+        view.accounts
+            .first()
+            .is_some_and(|a| a.windows.iter().any(|w| w.rate.is_some()))
+    })
+    .await;
+    let view = manager.view().await;
+    let rate = view.accounts[0]
+        .windows
+        .iter()
+        .find(|w| w.rate.is_some())
+        .and_then(|w| w.rate.as_ref())
+        .expect("重启刷新后速率应恢复");
+    assert!(
+        !rate.points.is_empty(),
+        "重启前的采样点应从 history.json 恢复"
+    );
 }

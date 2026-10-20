@@ -43,9 +43,8 @@ mod imp {
         let access = if write { KEY_WRITE } else { KEY_READ };
         let mut key: HKEY = std::ptr::null_mut();
         // SAFETY: path 是以 NUL 结尾的合法 UTF-16，key 出参由我们初始化后释放。
-        let rc: WIN32_ERROR = unsafe {
-            RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut key)
-        };
+        let rc: WIN32_ERROR =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut key) };
         (rc == ERROR_SUCCESS).then_some(key)
     }
 
@@ -134,10 +133,7 @@ mod imp {
 
     /// 归一化启动命令以便比较：去引号、去空白、大小写与斜杠方向统一。
     fn normalize_cmd(s: &str) -> String {
-        s.trim()
-            .trim_matches('"')
-            .to_lowercase()
-            .replace('/', "\\")
+        s.trim().trim_matches('"').to_lowercase().replace('/', "\\")
     }
 }
 
@@ -212,6 +208,9 @@ mod tests {
     #[test]
     fn exe_command_is_quoted() {
         let cmd = exe_command().expect("测试二进制应有路径");
-        assert!(cmd.starts_with('"') && cmd.ends_with('"'), "路径应带引号: {cmd}");
+        assert!(
+            cmd.starts_with('"') && cmd.ends_with('"'),
+            "路径应带引号: {cmd}"
+        );
     }
 }

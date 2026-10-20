@@ -4,10 +4,16 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use eframe::App;
-use egui::{Align, Color32, CornerRadius, Frame, Layout, RichText, Stroke, Vec2};
+use egui::{
+    Align, Color32, CornerRadius, Frame, Layout, Pos2, RichText, Sense, Shape, Stroke, Vec2, pos2,
+    vec2,
+};
 
 use crate::bridge::{Bridge, Command};
-use crate::icons::{self, Icon, ACCENT, BAD, BAD_FILL, BG_APP, BG_CARD, BG_CARD_ALT, BG_PANEL, BORDER, OK, TEXT_HI, TEXT_MID, WARN, WARN_FILL};
+use crate::icons::{
+    self, ACCENT, BAD, BAD_FILL, BG_APP, BG_CARD, BG_CARD_ALT, BG_PANEL, BORDER, Icon, OK, TEXT_HI,
+    TEXT_MID, WARN, WARN_FILL,
+};
 use crate::tray::{Tray, TrayCmd, TrayEvent, TrayStatus};
 
 /// 取 egui 主窗口的 Win32 HWND。
@@ -40,8 +46,8 @@ fn hide_main_window(frame: &mut eframe::Frame) {
     }
 }
 use zcode_model::{
-    AccountView, AppState, KeyStatus, KeyView, Settings, WindowView, format_countdown,
-    normalize_percent,
+    AccountView, AppState, KeyStatus, KeyView, RatePoint, Settings, WindowView, format_countdown,
+    format_rate,
 };
 
 /// 用量配色的阈值。
@@ -102,9 +108,11 @@ impl BoardApp {
         let tray = Tray::spawn("zcode 额度看板");
         // 桌面提醒走托盘气泡（带系统提示音、归属本应用而非 PowerShell）。
         let notify_tx = tray.notify_sender();
-        bridge.send(Command::SetNotifier(std::sync::Arc::new(move |title, body| {
-            let _ = notify_tx.send(TrayCmd::Balloon { title, body });
-        })));
+        bridge.send(Command::SetNotifier(std::sync::Arc::new(
+            move |title, body| {
+                let _ = notify_tx.send(TrayCmd::Balloon { title, body });
+            },
+        )));
         Self {
             bridge,
             state: AppState::default(),
@@ -150,7 +158,7 @@ impl BoardApp {
         self.send(Command::RefreshAll);
     }
 
-    /// 把账户状态同步到托盘与任务栏：图标颜色 + 悬停提示（2 秒节流，避免每帧都推）。
+    /// 把用量档位同步到托盘与任务栏：图标颜色 + 悬停提示（2 秒节流，避免每帧都推）。
     ///
     /// 任务栏/标题栏图标与托盘图标用同一份像素、随状态一起换色——
     /// 否则托盘变黄/红时任务栏还停在启动时的绿色，两边对不上。
@@ -170,13 +178,9 @@ impl BoardApp {
         let total = keys.len();
         let accounts = self.state.accounts.len();
 
-        let status = if errors > 0 {
-            TrayStatus::Error
-        } else if total > 0 && keys.iter().all(|k| k.status == KeyStatus::Ok) {
-            TrayStatus::Ok
-        } else {
-            TrayStatus::Idle
-        };
+        // 图标档位跟随「启用通知的 plan」的用量而非探测成败：
+        // 任意绿→绿，否则任意黄→黄，否则红（含全局关通知、全静音、无数据）。
+        let status = tray_status_from(&self.state);
         if self.last_tray_status != Some(status) {
             self.tray.set_status(status);
             // 任务栏/标题栏图标同步换色：egui 的 ViewportCommand::Icon 底层
@@ -239,8 +243,15 @@ impl BoardApp {
                         } else {
                             "立即刷新"
                         };
-                        if icons::pill_button(ui, Icon::Refresh, label, true, !refreshing, refreshing)
-                            .clicked()
+                        if icons::pill_button(
+                            ui,
+                            Icon::Refresh,
+                            label,
+                            true,
+                            !refreshing,
+                            refreshing,
+                        )
+                        .clicked()
                         {
                             self.refresh_all();
                         }
@@ -249,7 +260,8 @@ impl BoardApp {
                         {
                             self.show_settings = !self.show_settings;
                         }
-                        if icons::icon_toggle(ui, Icon::Log, self.show_log, "事件日志").clicked() {
+                        if icons::icon_toggle(ui, Icon::Log, self.show_log, "事件日志").clicked()
+                        {
                             self.show_log = !self.show_log;
                         }
                         ui.separator();
@@ -279,7 +291,7 @@ impl BoardApp {
 
                 ui.add_space(4.0);
 
-                // 全局：下一次额度刷新 + 下一次自动刷新倒计时
+                // 全局：下一次额度刷新 + 下一次自动刷新倒计时 + 速率区间选择
                 ui.horizontal(|ui| {
                     if let Some(next) = global_next_reset(&self.state.accounts) {
                         let left = format_countdown(next - now_ms);
@@ -299,6 +311,38 @@ impl BoardApp {
                         );
                     } else {
                         label_kv(ui, "下一次自动刷新", "已关闭", TEXT_MID);
+                    }
+
+                    // 速率图表的回看区间（持久化在设置里，重启后保持）。
+                    ui.separator();
+                    icons::glyph(ui, Icon::Activity, 13.0, TEXT_MID)
+                        .on_hover_text("各窗口卡片显示「区间内速率变化」，在这里选回看区间");
+                    ui.label(RichText::new("速率区间").color(TEXT_MID));
+                    let current = self.state.settings.rate_span_secs;
+                    for (label, secs) in [
+                        ("30m", 1_800),
+                        ("1h", 3_600),
+                        ("6h", 21_600),
+                        ("24h", 86_400),
+                        ("全部", 0),
+                    ] {
+                        if ui
+                            .selectable_label(
+                                current == secs,
+                                RichText::new(label).small().color(if current == secs {
+                                    ACCENT
+                                } else {
+                                    TEXT_MID
+                                }),
+                            )
+                            .clicked()
+                        {
+                            let mut next = self.state.settings.clone();
+                            next.rate_span_secs = secs;
+                            // 与设置面板同一套草稿机制：面板开着也立刻看到一致状态。
+                            self.settings_draft = Some(next.clone());
+                            self.send(Command::UpdateSettings(next));
+                        }
                     }
                 });
             });
@@ -346,8 +390,8 @@ impl BoardApp {
                             egui::TextEdit::singleline(&mut self.rename_text).desired_width(220.0),
                         );
                         // 只在输入框本身聚焦时响应回车，避免别的控件按回车误提交。
-                        let mut done = resp.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let mut done =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if icons::icon_button(ui, Icon::Check, "确认改名", 14.0).clicked() {
                             done = true;
                         }
@@ -382,13 +426,8 @@ impl BoardApp {
                             {
                                 self.send(Command::SetMuted(account.id.clone(), false));
                             }
-                        } else if icons::icon_button(
-                            ui,
-                            Icon::Bell,
-                            "静音该账户的刷新提醒",
-                            15.0,
-                        )
-                        .clicked()
+                        } else if icons::icon_button(ui, Icon::Bell, "静音该账户的刷新提醒", 15.0)
+                            .clicked()
                         {
                             self.send(Command::SetMuted(account.id.clone(), true));
                         }
@@ -397,18 +436,34 @@ impl BoardApp {
                         {
                             self.pending_delete_account = Some(account.id.clone());
                         }
-                        if icons::icon_button(ui, Icon::Refresh, "刷新该账户", 15.0).clicked() {
+                        if icons::icon_button(ui, Icon::Refresh, "刷新该账户", 15.0).clicked()
+                        {
                             self.send(Command::RefreshAccount(account.id.clone()));
                         }
                     });
                 });
 
-                // ── 配额窗口 ──
+                // ── 配额窗口：短窗口（5 小时档）主展示，周 / 月降级为紧凑摘要行 ──
                 if account.windows.is_empty() {
                     ui.label(RichText::new("暂无额度数据").color(TEXT_MID));
-                }
-                for w in &account.windows {
-                    window_row(ui, w, now_ms, lead_ms(self));
+                } else {
+                    let (primary, secondary): (Vec<&WindowView>, Vec<&WindowView>) = account
+                        .windows
+                        .iter()
+                        .partition(|w| is_primary_window(w));
+                    for w in &primary {
+                        primary_window(ui, w, now_ms, lead_ms(self), self.state.settings.rate_span_secs);
+                    }
+                    if !secondary.is_empty() {
+                        ui.add_space(4.0);
+                        secondary_window_rows(
+                            ui,
+                            &secondary,
+                            now_ms,
+                            &account.id,
+                            lead_ms(self),
+                        );
+                    }
                 }
 
                 // ── key 列表 ──
@@ -474,21 +529,30 @@ impl BoardApp {
                         ui.add_space(4.0);
                         ui.label("并发探测数");
                         let mut c = settings.concurrency as f64;
-                        if ui.add(egui::DragValue::new(&mut c).speed(1).range(1.0..=16.0)).changed() {
+                        if ui
+                            .add(egui::DragValue::new(&mut c).speed(1).range(1.0..=16.0))
+                            .changed()
+                        {
                             settings.concurrency = c as usize;
                             refresh = true;
                         }
                         ui.add_space(4.0);
                         ui.label("请求超时（秒）");
                         let mut t = settings.request_timeout_secs as f64;
-                        if ui.add(egui::DragValue::new(&mut t).speed(1).range(3.0..=120.0)).changed() {
+                        if ui
+                            .add(egui::DragValue::new(&mut t).speed(1).range(3.0..=120.0))
+                            .changed()
+                        {
                             settings.request_timeout_secs = t as u64;
                             refresh = true;
                         }
                     });
 
                     group(ui, "下一次刷新提醒", |ui| {
-                        if ui.checkbox(&mut settings.notify_enabled, "启用刷新提醒").changed() {
+                        if ui
+                            .checkbox(&mut settings.notify_enabled, "启用刷新提醒")
+                            .changed()
+                        {
                             refresh = true;
                         }
                         ui.add_space(2.0);
@@ -536,11 +600,13 @@ impl BoardApp {
                                 }
                             ))
                             .small()
-                            .color(if self.autostart_actual == settings.start_with_windows {
-                                TEXT_MID
-                            } else {
-                                WARN
-                            }),
+                            .color(
+                                if self.autostart_actual == settings.start_with_windows {
+                                    TEXT_MID
+                                } else {
+                                    WARN
+                                },
+                            ),
                         );
                         ui.add_space(4.0);
                         if ui
@@ -565,35 +631,6 @@ impl BoardApp {
                                 .color(WARN),
                             );
                         }
-                    });
-
-                    group(ui, "上游接口", |ui| {
-                        ui.label("额度查询端点");
-                        if ui
-                            .text_edit_singleline(&mut settings.quota_endpoint)
-                            .changed()
-                        {
-                            refresh = true;
-                        }
-                        ui.add_space(4.0);
-                        ui.label("附加请求头（可选）");
-                        let mut hdrs = settings.extra_headers.clone();
-                        if ui
-                            .add(
-                                egui::TextEdit::multiline(&mut hdrs)
-                                    .desired_rows(2)
-                                    .desired_width(f32::INFINITY),
-                            )
-                            .changed()
-                        {
-                            settings.extra_headers = hdrs;
-                            refresh = true;
-                        }
-                        ui.label(
-                            RichText::new("每行一个 `Header-Name: value`，一般用不到。")
-                                .small()
-                                .color(TEXT_MID),
-                        );
                     });
 
                     ui.add_space(8.0);
@@ -877,9 +914,7 @@ impl BoardApp {
                                 ui.label(RichText::new("KEY").small().color(ACCENT));
                                 ui.label(RichText::new(&item.label).strong().color(TEXT_HI));
                                 if imported {
-                                    ui.label(
-                                        RichText::new("已导入").small().color(OK),
-                                    );
+                                    ui.label(RichText::new("已导入").small().color(OK));
                                 }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.label(
@@ -964,10 +999,8 @@ impl BoardApp {
                     ui.horizontal(|ui| {
                         icons::glyph(ui, Icon::Link, 16.0, ACCENT);
                         ui.label(
-                            RichText::new(format!(
-                                "{names} 的额度数据完全相同，疑似同一个账户"
-                            ))
-                            .color(TEXT_HI),
+                            RichText::new(format!("{names} 的额度数据完全相同，疑似同一个账户"))
+                                .color(TEXT_HI),
                         );
                         if ui
                             .button("合并为一个账户")
@@ -1244,50 +1277,577 @@ fn empty_state(ui: &mut egui::Ui) {
     });
 }
 
-fn window_row(ui: &mut egui::Ui, w: &WindowView, now_ms: i64, lead_ms: i64) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(&w.label).color(TEXT_MID));
+// ─────────────────────────── 配额窗口（分层展示） ───────────────────────────
 
-        let pct = normalize_percent(w.used_percent);
-        let bar = egui::ProgressBar::new((pct / 100.0) as f32)
-            .desired_width(160.0)
-            .desired_height(8.0)
-            .fill(usage_color(pct));
-        ui.add(bar);
-        ui.label(RichText::new(format!("{pct:.0}%")).color(usage_color(pct)));
+/// 短窗口时长上限：≤6 小时的窗口（即 5 小时档）视为主要展示对象。
+const PRIMARY_WINDOW_MAX_MS: i64 = 6 * 3_600_000;
 
-        // 有具体数字时显示「已用 / 总量」，比百分比更直观
-        if let (Some(used), Some(total)) = (w.used, w.total) {
-            ui.label(
-                RichText::new(format!("{used}/{total}"))
-                    .monospace()
-                    .color(TEXT_MID),
-            )
-            .on_hover_text(format!("已用 {} / 共 {}", used, total));
-        }
+/// 主窗口判定：5 小时档短窗口是日常最紧、最常看的额度约束，
+/// 周 / 月等长周期窗口（以及无法推断时长的未知窗口）降级为摘要行。
+fn is_primary_window(w: &WindowView) -> bool {
+    w.window_ms.is_some_and(|ms| ms <= PRIMARY_WINDOW_MAX_MS)
+        || w
+            .key
+            .rsplit_once(':')
+            .and_then(|(_, unit)| unit.parse::<u32>().ok())
+            == Some(3)
+}
 
-        if let Some(reset) = w.next_reset_ms {
-            let delta = reset - now_ms;
-            let urgent = delta <= lead_ms;
-            let txt = if delta <= 0 {
-                "已到刷新时间".to_string()
-            } else {
-                format!("刷新倒计时 {}", format_countdown(delta))
-            };
-            ui.label(RichText::new(txt).color(if urgent { BAD } else { TEXT_MID }));
+/// 主窗口大展示：亮底容器 + 大号百分比 + 全宽粗进度条 +
+/// 大字「X 后重置 / 预计 X 后用满」+ 速率曲线。
+///
+/// 这两个倒计时回答的是「我现在还敢不敢放开用」，是整个看板的核心信息，
+/// 因此用主字号；周 / 月窗口见 [`secondary_window_rows`]。
+fn primary_window(
+    ui: &mut egui::Ui,
+    w: &WindowView,
+    now_ms: i64,
+    lead_ms: i64,
+    rate_span_secs: u64,
+) {
+    Frame::new()
+        .fill(BG_CARD_ALT)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width() - 2.0);
+            let pct = w.used_percent;
+            let color = usage_color(pct);
 
-            // 时间进度：占整个窗口的比例
-            if let Some(total) = w.window_ms {
-                let elapsed = (total - delta.max(0).min(total)).max(0);
-                let frac = (elapsed as f32 / total.max(1) as f32).clamp(0.0, 1.0);
-                let bar = egui::ProgressBar::new(frac)
-                    .desired_width(90.0)
-                    .desired_height(6.0)
-                    .fill(ACCENT);
-                ui.add(bar).on_hover_text("窗口时间进度");
+            // 行 1：窗口名（左） + 已用/总量 与 大号百分比（右）
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&w.label).size(12.5).color(TEXT_MID));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{pct:.0}%"))
+                            .size(24.0)
+                            .strong()
+                            .color(color),
+                    )
+                    .on_hover_text(per_key_tooltip(w));
+                    if let (Some(used), Some(total)) = (w.used, w.total) {
+                        ui.label(
+                            RichText::new(format!("{used}/{total}"))
+                                .monospace()
+                                .size(13.0)
+                                .color(TEXT_MID),
+                        )
+                        .on_hover_text(format!("已用 {} / 共 {}", used, total));
+                    }
+                });
+            });
+
+            // 行 2：全宽粗进度条（时间进度移入悬停提示，不再单独占一条小条）
+            full_width_bar(ui, (pct / 100.0) as f32, 12.0, color)
+                .on_hover_text(if let (Some(total_ms), Some(reset)) = (w.window_ms, w.next_reset_ms)
+                {
+                    let delta = (reset - now_ms).clamp(0, total_ms);
+                    let frac = 1.0 - delta as f32 / total_ms.max(1) as f32;
+                    format!(
+                        "窗口时间进度 {:.0}%（剩 {}）",
+                        frac * 100.0,
+                        fmt_countdown_compact(reset - now_ms)
+                    )
+                } else {
+                    "窗口时间进度".to_string()
+                });
+
+            // 行 3：核心倒计时（大字）——左「X 后重置」，右「预计 X 后用满」
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if let Some(reset) = w.next_reset_ms {
+                    let delta = reset - now_ms;
+                    let urgent = delta <= lead_ms;
+                    if delta > 0 {
+                        icons::glyph(ui, Icon::Clock, 15.0, if urgent { BAD } else { OK });
+                        ui.label(
+                            RichText::new(format!("{} 后重置", fmt_countdown_compact(delta)))
+                                .size(16.0)
+                                .strong()
+                                .color(if urgent { BAD } else { TEXT_HI }),
+                        )
+                        .on_hover_text(format!(
+                            "精确 {}，时刻 {}",
+                            format_countdown(delta),
+                            fmt_hm(reset)
+                        ));
+                        ui.label(
+                            RichText::new(fmt_hm(reset))
+                                .small()
+                                .color(TEXT_MID),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("已到刷新时间")
+                                .size(16.0)
+                                .strong()
+                                .color(BAD),
+                        );
+                    }
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // right_to_left 中先加的在最右：文字最右、图标在其左侧。
+                    match eta_state(w, now_ms) {
+                        Some(EtaState::Exhaust { eta_ms, reset_first }) => {
+                            // 重置先到 = 本窗口实际不会用满，弱色即可；
+                            // 否则按紧急程度红 / 黄警示。
+                            let urgent = !reset_first && eta_ms <= 6 * 3_600_000;
+                            let color = if !reset_first && eta_ms <= lead_ms {
+                                BAD
+                            } else if urgent {
+                                WARN
+                            } else {
+                                TEXT_MID
+                            };
+                            let hover = if reset_first {
+                                format!(
+                                    "按当前速率 {} 后才会用完，而重置（{} 后）先到，届时额度会刷新",
+                                    fmt_duration_rough(eta_ms),
+                                    fmt_countdown_compact(
+                                        w.next_reset_ms.unwrap_or(now_ms) - now_ms
+                                    )
+                                )
+                            } else {
+                                "剩余量 ÷ 当前速率的线性外推，仅供参考".to_string()
+                            };
+                            ui.label(
+                                RichText::new(format!("预计 {} 后用满", fmt_duration_rough(eta_ms)))
+                                    .size(16.0)
+                                    .strong()
+                                    .color(color),
+                            )
+                            .on_hover_text(hover);
+                            if urgent {
+                                icons::glyph(ui, Icon::Warning, 15.0, color);
+                            }
+                        }
+                        Some(EtaState::Idle) => {
+                            ui.label(RichText::new("当前无消耗").size(16.0).color(TEXT_MID));
+                        }
+                        None => {}
+                    }
+                });
+            });
+
+            rate_section(ui, w, rate_span_secs);
+        });
+    ui.add_space(4.0);
+}
+
+/// 次要窗口（周 / 月等长周期）：单行紧凑摘要，Grid 对齐，
+/// 刻意小字弱化——它们只在本周 / 本月预算吃紧时才值得细看。
+///
+/// 「预计 X 后用满」在数据满足时照常显示：月度预算的耗尽时间
+/// （如「预计 3.0 天后用满」）恰恰是这类窗口最值得看的信息。
+fn secondary_window_rows(
+    ui: &mut egui::Ui,
+    windows: &[&WindowView],
+    now_ms: i64,
+    account_id: &str,
+    lead_ms: i64,
+) {
+    egui::Grid::new(format!("sec_windows_{account_id}"))
+        .num_columns(5)
+        .spacing([12.0, 5.0])
+        .show(ui, |ui| {
+            for w in windows {
+                let pct = w.used_percent;
+                ui.label(RichText::new(&w.label).small().color(TEXT_MID));
+                ui.add(
+                    egui::ProgressBar::new((pct / 100.0) as f32)
+                        .desired_width(76.0)
+                        .desired_height(5.0)
+                        .fill(usage_color(pct)),
+                );
+                let mut txt = format!("{pct:.0}%");
+                if let (Some(used), Some(total)) = (w.used, w.total) {
+                    txt = format!("{pct:.0}% · {used}/{total}");
+                }
+                ui.label(
+                    RichText::new(txt)
+                        .small()
+                        .monospace()
+                        .color(usage_color(pct)),
+                )
+                .on_hover_text(per_key_tooltip(w));
+                // 预计用满：月度预算 5 小时内耗尽算相当紧急，沿用与主窗口
+                // 相同的紧急阈值（提醒提前量 → 红，6 小时 → 黄）。
+                match eta_state(w, now_ms) {
+                    Some(EtaState::Exhaust { eta_ms, reset_first }) => {
+                        let color = if reset_first {
+                            TEXT_MID
+                        } else if eta_ms <= lead_ms {
+                            BAD
+                        } else if eta_ms <= 6 * 3_600_000 {
+                            WARN
+                        } else {
+                            TEXT_MID
+                        };
+                        ui.label(
+                            RichText::new(format!("预计 {} 后用满", fmt_duration_rough(eta_ms)))
+                                .small()
+                                .color(color),
+                        )
+                        .on_hover_text(if reset_first {
+                            "按当前速率要到这之后才会用完，而重置会先到，届时额度刷新"
+                        } else {
+                            "剩余量 ÷ 当前速率的线性外推，仅供参考"
+                        });
+                    }
+                    Some(EtaState::Idle) => {
+                        ui.label(RichText::new("无消耗").small().color(TEXT_MID));
+                    }
+                    None => {
+                        ui.label(RichText::new("").small());
+                    }
+                }
+                if let Some(reset) = w.next_reset_ms {
+                    let delta = (reset - now_ms).max(0);
+                    ui.label(
+                        RichText::new(format!("{} 后重置", fmt_duration_rough(delta)))
+                            .small()
+                            .color(TEXT_MID),
+                    );
+                } else {
+                    ui.label(RichText::new("—").small().color(TEXT_MID));
+                }
+                ui.end_row();
             }
+        });
+}
+
+/// 「预计用满」的展示三态。
+#[derive(Debug)]
+enum EtaState {
+    /// 按当前速率 X 后用满。reset_first 表示重置会先到（届时额度刷新、
+    /// 实际不会用满）——数字照样给出，只是弱色 + 悬停说明。
+    Exhaust { eta_ms: i64, reset_first: bool },
+    /// 有速率统计但当前消耗为 0（如月度窗口长时间没有调用）。
+    Idle,
+}
+
+/// 按当前速率线性外推「多久后用满」。
+///
+/// 重置先到时不再返回 None 把整个数字藏起来——用户明确要看这个数，
+/// 藏起来只会让人以为坏了；改为返回 reset_first 标记交展示层弱化。
+fn eta_state(w: &WindowView, now_ms: i64) -> Option<EtaState> {
+    let rate = w.rate.as_ref()?;
+    // basis = 0 表示连「当前速率」都没统计出来（跨度不足 / 离线间隙）。
+    if rate.basis_ms <= 0 {
+        return None;
+    }
+    if rate.current_per_min <= 0.0 {
+        return Some(EtaState::Idle);
+    }
+    // 百分比序列没有「剩余量」数字，用 100% − 已用百分比 兜底。
+    let remaining = match w.remaining {
+        Some(r) => r,
+        None if rate.percent_based => (100.0 - w.used_percent).max(0.0),
+        None => return None,
+    };
+    if remaining <= 0.0 {
+        return None;
+    }
+    let eta_ms = (remaining / rate.current_per_min * 60_000.0) as i64;
+    let reset_first = w
+        .next_reset_ms
+        .is_some_and(|reset| eta_ms >= reset - now_ms);
+    Some(EtaState::Exhaust { eta_ms, reset_first })
+}
+
+/// 各 key 用量百分比的悬停明细（聚合值代表最紧的一个 key）。
+fn per_key_tooltip(w: &WindowView) -> String {
+    if w.per_key.is_empty() {
+        return format!("{} 个 key 聚合，取最紧值", w.key_count);
+    }
+    let lines: Vec<String> = w
+        .per_key
+        .iter()
+        .map(|p| format!("{}：{:.0}%", p.key_label, p.used_percent))
+        .collect();
+    lines.join("\n")
+}
+
+/// 大字倒计时的人话格式：<1 分钟「42秒」；<1 小时「37分钟」；
+/// <1 天「2小时13分」；≥1 天「3.5天」。
+fn fmt_countdown_compact(delta_ms: i64) -> String {
+    let s = (delta_ms / 1000).max(0);
+    if s < 60 {
+        format!("{s}秒")
+    } else if s < 3_600 {
+        format!("{}分钟", s / 60)
+    } else if s < 86_400 {
+        let (h, m) = (s / 3_600, (s % 3_600) / 60);
+        if m > 0 {
+            format!("{h}小时{m}分")
+        } else {
+            format!("{h}小时")
         }
+    } else {
+        format!("{:.1}天", s as f64 / 86_400.0)
+    }
+}
+
+// ─────────────────────────── 消耗速率 ───────────────────────────
+
+/// 主窗口下方的速率区：当前速率 / 区间峰均 + 速率曲线。
+/// 「预计 X 后用满」已上移到主窗口倒计时行，这里不再重复。
+///
+/// 数据来源是后台每次刷新积累的用量采样（见 core::rate）：
+/// - 当前速率 = 最近一段时间的平均差分（不跨窗口重置、不跨离线间隙）；
+/// - 曲线 = 所选区间内的逐区间瞬时速率，随每次刷新向右生长。
+fn rate_section(ui: &mut egui::Ui, w: &WindowView, span_secs: u64) {
+    let Some(rate) = &w.rate else {
+        // 有信号（数值或百分比）的窗口都在采样：刚导入时提示积累中。
+        if w.used.is_some() || w.used_percent > 0.0 {
+            ui.label(
+                RichText::new("速率：等待更多采样点（每次刷新积累一个，两个起绘曲线）")
+                    .small()
+                    .color(TEXT_MID),
+            );
+        }
+        return;
+    };
+
+    // 内部速率统一是「每分钟」；百分比序列粗量化，展示放大到 %/h 更可读。
+    let display_scale = if rate.percent_based { 60.0 } else { 1.0 };
+    let scoped = filter_rate_points(&rate.points, span_secs);
+
+    ui.horizontal(|ui| {
+        icons::glyph(ui, Icon::Activity, 13.0, ACCENT);
+        if rate.basis_ms > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "当前 {} {}",
+                    format_rate(rate.current_per_min * display_scale),
+                    rate.unit
+                ))
+                .strong()
+                .color(TEXT_HI),
+            );
+            ui.label(
+                RichText::new(format!("（近 {}）", fmt_span_rough(rate.basis_ms)))
+                    .small()
+                    .color(TEXT_MID),
+            );
+        } else {
+            ui.label(
+                RichText::new("当前 —（采样跨度不足或离线间隙）")
+                    .small()
+                    .color(TEXT_MID),
+            );
+        }
+
+        if let Some((peak, avg)) = rate_stats(scoped) {
+            ui.label(
+                RichText::new(format!(
+                    "峰 {} · 均 {}",
+                    format_rate(peak * display_scale),
+                    format_rate(avg * display_scale)
+                ))
+                .small()
+                .color(TEXT_MID),
+            )
+            .on_hover_text(format!(
+                "所选区间内逐次刷新的瞬时速率：最高 {} {}，平均 {} {}",
+                format_rate(peak * display_scale),
+                rate.unit,
+                format_rate(avg * display_scale),
+                rate.unit
+            ));
+        }
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let n = scoped.len();
+            ui.label(
+                RichText::new(format!("{n} 个采样点 · 区间 {}", span_label(span_secs)))
+                    .small()
+                    .color(TEXT_MID),
+            );
+        });
     });
+
+    if scoped.len() >= 2 {
+        rate_chart(ui, scoped, &rate.unit, display_scale);
+    } else if !rate.points.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "区间 {} 内只有 {}/2 个采样点，曲线等待积累",
+                span_label(span_secs),
+                scoped.len()
+            ))
+            .small()
+            .color(TEXT_MID),
+        );
+    }
+}
+
+/// 速率迷你曲线：面积折线 + 峰值参考线 + 时间轴标签 + 悬停读数。
+/// `display_scale` 把内部的「每分钟」换算到展示单位（百分比序列 ×60 → %/h）。
+fn rate_chart(ui: &mut egui::Ui, points: &[RatePoint], unit: &str, display_scale: f64) {
+    let height = 46.0;
+    // 宽度钳到有限值：上游布局一旦给出无限宽（见 full_width_bar 的注释），
+    // 虚线循环会吃满内存挂死界面——宁可画窄，不能挂死。
+    let width = ui.available_width().min(4096.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let p = ui.painter();
+
+    let t0 = points[0].t_ms;
+    let t1 = points[points.len() - 1].t_ms;
+    let span_px = (t1 - t0).max(1) as f32;
+    let peak = points
+        .iter()
+        .map(|s| s.per_min)
+        .fold(f64::MIN, f64::max)
+        .max(1e-9);
+    let v_top = peak * 1.18; // 峰值线上方留出标签空间
+
+    let inner = rect.shrink(2.0);
+    let axis_y = inner.bottom() - 11.0; // 底部留时间标签的高度
+    let plot_h = (axis_y - inner.top() - 10.0).max(8.0); // 顶部留峰值标签
+    let x_of = |t: i64| inner.left() + (t - t0) as f32 / span_px * inner.width();
+    let y_of = |v: f64| axis_y - (v / v_top) as f32 * plot_h;
+
+    // 基线与面积折线
+    p.line_segment(
+        [pos2(inner.left(), axis_y), pos2(inner.right(), axis_y)],
+        Stroke::new(1.0, BORDER),
+    );
+    let pts: Vec<Pos2> = points
+        .iter()
+        .map(|s| pos2(x_of(s.t_ms), y_of(s.per_min)))
+        .collect();
+    let mut area = pts.clone();
+    area.push(pos2(pts[pts.len() - 1].x, axis_y));
+    area.push(pos2(pts[0].x, axis_y));
+    p.add(Shape::convex_polygon(
+        area,
+        ACCENT.gamma_multiply(0.13),
+        Stroke::NONE,
+    ));
+    p.add(Shape::line(pts.clone(), Stroke::new(1.5, ACCENT)));
+
+    // 峰值虚线 + 末端点
+    let peak_y = y_of(peak);
+    let dash = 4.0;
+    let mut x = inner.left();
+    while x < inner.right() {
+        let end = (x + dash).min(inner.right());
+        p.line_segment(
+            [pos2(x, peak_y), pos2(end, peak_y)],
+            Stroke::new(1.0, WARN.gamma_multiply(0.55)),
+        );
+        x += dash * 2.0;
+    }
+    p.add(Shape::circle_filled(pts[pts.len() - 1], 2.4, ACCENT));
+
+    // 标签：左/右端时间、峰值刻度
+    let small = egui::TextStyle::Small.resolve(ui.style()).size * 0.86;
+    p.text(
+        pos2(inner.left(), inner.top()),
+        egui::Align2::LEFT_TOP,
+        format!("峰 {} {}", format_rate(peak * display_scale), unit),
+        egui::FontId::proportional(small),
+        WARN.gamma_multiply(0.9),
+    );
+    p.text(
+        pos2(inner.left(), axis_y + 2.0),
+        egui::Align2::LEFT_TOP,
+        fmt_hm(t0),
+        egui::FontId::proportional(small),
+        TEXT_MID,
+    );
+    p.text(
+        pos2(inner.right(), axis_y + 2.0),
+        egui::Align2::RIGHT_TOP,
+        fmt_hm(t1),
+        egui::FontId::proportional(small),
+        TEXT_MID,
+    );
+
+    // 悬停：最近点十字线 + 读数（点在图上跟随，文字走系统 tooltip）
+    if let Some(hover) = resp.hover_pos()
+        && let Some(s) = points.iter().min_by(|a, b| {
+            (x_of(a.t_ms) - hover.x)
+                .abs()
+                .total_cmp(&(x_of(b.t_ms) - hover.x).abs())
+        })
+    {
+        let (cx, cy) = (x_of(s.t_ms), y_of(s.per_min));
+        p.line_segment(
+            [pos2(cx, inner.top()), pos2(cx, axis_y)],
+            Stroke::new(1.0, TEXT_MID.gamma_multiply(0.6)),
+        );
+        p.add(Shape::circle_filled(pos2(cx, cy), 3.0, TEXT_HI));
+        resp.on_hover_text(format!(
+            "{} · {} {}",
+            fmt_hm(s.t_ms),
+            format_rate(s.per_min * display_scale),
+            unit
+        ));
+    }
+}
+
+/// 区间过滤：以最后一个采样点为锚，保留锚点前 `span_secs` 秒内的点；0 = 全部。
+fn filter_rate_points(points: &[RatePoint], span_secs: u64) -> &[RatePoint] {
+    if span_secs == 0 || points.len() < 2 {
+        return points;
+    }
+    let start = points[points.len() - 1].t_ms - span_secs as i64 * 1000;
+    let idx = points.partition_point(|p| p.t_ms < start);
+    &points[idx..]
+}
+
+/// 区间内逐点统计（峰 / 简单平均）。
+fn rate_stats(points: &[RatePoint]) -> Option<(f64, f64)> {
+    if points.is_empty() {
+        return None;
+    }
+    let peak = points.iter().map(|p| p.per_min).fold(f64::MIN, f64::max);
+    let avg = points.iter().map(|p| p.per_min).sum::<f64>() / points.len() as f64;
+    Some((peak.max(0.0), avg.max(0.0)))
+}
+
+/// 速率区间的显示名。
+fn span_label(secs: u64) -> &'static str {
+    match secs {
+        0 => "全部",
+        1_800 => "30 分钟",
+        3_600 => "1 小时",
+        21_600 => "6 小时",
+        86_400 => "24 小时",
+        _ => "自定义",
+    }
+}
+
+/// 统计跨度的粗略人话（「近 X」用）。
+fn fmt_span_rough(ms: i64) -> String {
+    let mins = (ms / 60_000).max(1);
+    if mins < 60 {
+        format!("{mins} 分钟")
+    } else {
+        format!("{:.0} 小时", mins as f64 / 60.0)
+    }
+}
+
+/// 预计用满的时长人话（分钟 / 小时 / 天）。
+fn fmt_duration_rough(ms: i64) -> String {
+    let mins = (ms / 60_000).max(0);
+    if mins < 60 {
+        format!("{mins} 分钟")
+    } else if mins < 48 * 60 {
+        format!("{:.1} 小时", mins as f64 / 60.0)
+    } else {
+        format!("{:.1} 天", mins as f64 / 1440.0)
+    }
+}
+
+/// `HH:MM`（图表时间轴标签）。
+fn fmt_hm(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn key_row(ui: &mut egui::Ui, app: &mut BoardApp, key: &KeyView, account: &AccountView) {
@@ -1299,8 +1859,7 @@ fn key_row(ui: &mut egui::Ui, app: &mut BoardApp, key: &KeyView, account: &Accou
             ui.horizontal(|ui| {
                 ui.label(RichText::new("KEY").small().color(ACCENT));
                 if key.account_pinned {
-                    icons::glyph(ui, Icon::Pin, 13.0, TEXT_MID)
-                        .on_hover_text("已手动固定到该账户");
+                    icons::glyph(ui, Icon::Pin, 13.0, TEXT_MID).on_hover_text("已手动固定到该账户");
                 }
                 ui.label(RichText::new(&key.masked).monospace().color(TEXT_MID));
 
@@ -1400,13 +1959,78 @@ fn label_kv(ui: &mut egui::Ui, k: &str, v: &str, color: Color32) {
     ui.add_space(14.0);
 }
 
+/// 全宽进度条。`desired_width` 必须是有限值：
+/// egui 0.32 对 `INFINITY` 的 allocate 会产出无限宽矩形并把它并进布局游标，
+/// 毒化后续 `available_width()`（也变 INFINITY）——速率图的虚线循环
+/// `while x < inner.right()` 随之永不终止，界面挂起、内存暴涨。
+fn full_width_bar(ui: &mut egui::Ui, fraction: f32, height: f32, color: Color32) -> egui::Response {
+    ui.add(
+        egui::ProgressBar::new(fraction)
+            .desired_width(ui.available_width())
+            .desired_height(height)
+            .fill(color),
+    )
+}
+
 fn usage_color(pct: f64) -> Color32 {
+    match usage_level(pct) {
+        TrayStatus::Green => OK,
+        TrayStatus::Yellow => WARN,
+        TrayStatus::Red => BAD,
+    }
+}
+
+/// 用量分档：与窗口进度条同一套阈值（60% / 85%）。
+fn usage_level(pct: f64) -> TrayStatus {
     if pct >= BAD_PERCENT {
-        BAD
+        TrayStatus::Red
     } else if pct >= WARN_PERCENT {
-        WARN
+        TrayStatus::Yellow
     } else {
-        OK
+        TrayStatus::Green
+    }
+}
+
+/// 单个 plan（账户）的档位：取其全部配额窗口的最高用量分档——最紧的窗口说了算。
+/// 没有任何窗口数据时返回 `None`，不参与绿/黄判定，只落红兜底。
+fn account_level(a: &AccountView) -> Option<TrayStatus> {
+    a.windows
+        .iter()
+        .map(|w| w.used_percent)
+        .max_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
+        .map(usage_level)
+}
+
+/// 图标档位聚合：启用通知的 plan（全局开关开 + 未静音）里
+/// 任意绿→绿，否则任意黄→黄，否则红。
+///
+/// 刷新失败时窗口数据保留上次值，图标不会因网络抖动闪变。
+fn tray_status_from(state: &AppState) -> TrayStatus {
+    if !state.settings.notify_enabled {
+        return TrayStatus::Red;
+    }
+    aggregate_status(
+        state
+            .accounts
+            .iter()
+            .filter(|a| !a.notify_muted)
+            .map(account_level),
+    )
+}
+
+fn aggregate_status(levels: impl Iterator<Item = Option<TrayStatus>>) -> TrayStatus {
+    let mut any_yellow = false;
+    for level in levels {
+        match level {
+            Some(TrayStatus::Green) => return TrayStatus::Green,
+            Some(TrayStatus::Yellow) => any_yellow = true,
+            _ => {}
+        }
+    }
+    if any_yellow {
+        TrayStatus::Yellow
+    } else {
+        TrayStatus::Red
     }
 }
 
@@ -1480,3 +2104,226 @@ pub fn configure_style(ctx: &egui::Context) {
 // 让 `Widget` trait 在文件里可用（ProgressBar::add 等）
 #[allow(unused_imports)]
 use egui::Widget as _;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_level_thresholds() {
+        assert_eq!(usage_level(0.0), TrayStatus::Green);
+        assert_eq!(usage_level(59.9), TrayStatus::Green);
+        assert_eq!(usage_level(60.0), TrayStatus::Yellow);
+        assert_eq!(usage_level(84.9), TrayStatus::Yellow);
+        assert_eq!(usage_level(85.0), TrayStatus::Red);
+        assert_eq!(usage_level(120.0), TrayStatus::Red);
+    }
+
+    #[test]
+    fn aggregate_best_wins() {
+        use TrayStatus::{Green, Red, Yellow};
+        let lvl = |pct: f64| Some(usage_level(pct));
+
+        // 任意绿 → 绿（红黄都被绿掩盖，图标回答的是「还有没有可放心用的 plan」）。
+        assert_eq!(
+            aggregate_status([lvl(30.0), lvl(70.0), lvl(90.0)].into_iter()),
+            Green
+        );
+        // 无绿有黄 → 黄。
+        assert_eq!(aggregate_status([lvl(70.0), lvl(90.0)].into_iter()), Yellow);
+        // 仅红 → 红。
+        assert_eq!(aggregate_status([lvl(90.0)].into_iter()), Red);
+        // 无数据的 plan 只落红兜底，不会挡住黄档。
+        assert_eq!(aggregate_status([None, lvl(65.0)].into_iter()), Yellow);
+        assert_eq!(aggregate_status([None, lvl(90.0)].into_iter()), Red);
+        // 空集合（全局关通知 / 全静音时走不到这里，但聚合本身兜底）→ 红。
+        assert_eq!(aggregate_status([None].into_iter()), Red);
+        assert_eq!(aggregate_status(std::iter::empty()), Red);
+    }
+
+    /// 造一条速率序列：从 `t0_min` 开始每分钟一个点，速率按 `rates`。
+    fn pts(t0_min: i64, rates: &[f64]) -> Vec<RatePoint> {
+        rates
+            .iter()
+            .enumerate()
+            .map(|(i, r)| RatePoint {
+                t_ms: (t0_min + i as i64) * 60_000,
+                per_min: *r,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rate_span_filter_anchors_at_latest_point() {
+        let points = pts(0, &[10.0; 120]); // 2 小时
+        // 回看 30 分钟：只留最后 31 个点（闭区间含左边界锚点），且始终包含
+        // 最后一个点作为右端锚。
+        let scoped = filter_rate_points(&points, 1_800);
+        assert_eq!(scoped.len(), 31);
+        assert_eq!(scoped[scoped.len() - 1].t_ms, points[points.len() - 1].t_ms);
+        // 0 = 全部。
+        assert_eq!(filter_rate_points(&points, 0).len(), 120);
+        // 单点 / 空序列安全返回。
+        assert_eq!(filter_rate_points(&points[..1], 1_800).len(), 1);
+        assert!(filter_rate_points(&[], 1_800).is_empty());
+    }
+
+    #[test]
+    fn rate_stats_peak_and_avg() {
+        let points = pts(0, &[100.0, 300.0, 200.0]);
+        let (peak, avg) = rate_stats(&points).unwrap();
+        assert_eq!(peak, 300.0);
+        assert!((avg - 200.0).abs() < 1e-9);
+        assert!(rate_stats(&[]).is_none());
+    }
+
+    #[test]
+    fn duration_and_span_formatting() {
+        assert_eq!(fmt_duration_rough(5 * 60_000), "5 分钟");
+        assert_eq!(fmt_duration_rough(90 * 60_000), "1.5 小时");
+        assert_eq!(fmt_duration_rough(3 * 24 * 3_600_000), "3.0 天");
+        assert_eq!(fmt_span_rough(45 * 60_000), "45 分钟");
+        assert_eq!(fmt_span_rough(5 * 60_000), "5 分钟");
+        assert_eq!(fmt_span_rough(300 * 60_000), "5 小时");
+    }
+
+    /// 用有限屏幕跑一帧真实 egui 布局（回归测试用）。
+    /// `ctx.run` 会多 pass 调用，闭包须为 `Fn`。
+    fn run_in_test_ui(f: impl Fn(&mut egui::Ui)) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| f(ui));
+        });
+    }
+
+    /// 回归：全宽进度条不能把布局游标毒化成无限宽。
+    ///
+    /// 历史事故：直接 `desired_width(f32::INFINITY)` 会让 egui 产出无限宽
+    /// 矩形并并进游标，后续 `available_width()` 变 INFINITY，速率图的虚线
+    /// 循环永不终止——界面挂起（Windows 事件 1002）+ 内存暴涨到 2GB。
+    #[test]
+    fn full_width_bar_does_not_poison_layout() {
+        // 先证明毒源确实存在于 egui 0.32（若未来升级 egui 修复了该行为，
+        // 此断言失败是提醒我们重新评估防御措施，属预期）。
+        run_in_test_ui(|ui| {
+            ui.add(egui::ProgressBar::new(0.5).desired_width(f32::INFINITY));
+            assert!(
+                !ui.available_width().is_finite(),
+                "egui 0.32 的 INFINITY 进度条未毒化游标？防御前提已变，请复查"
+            );
+        });
+
+        // 我们的 helper 必须保持有限宽，且真的占满可用宽度。
+        run_in_test_ui(|ui| {
+            let before = ui.available_width();
+            let resp = full_width_bar(ui, 0.5, 12.0, OK);
+            assert!(ui.available_width().is_finite());
+            assert_eq!(resp.rect.width(), before);
+            // 下一行再取可用宽度依然正常（游标未被毒化）。
+            let after = ui.available_width();
+            assert!(after.is_finite() && after > 0.0);
+        });
+    }
+
+    #[test]
+    fn countdown_compact_formatting() {
+        assert_eq!(fmt_countdown_compact(42_000), "42秒");
+        assert_eq!(fmt_countdown_compact(37 * 60_000), "37分钟");
+        assert_eq!(
+            fmt_countdown_compact((2 * 3_600 + 13 * 60) * 1000),
+            "2小时13分"
+        );
+        assert_eq!(fmt_countdown_compact(5 * 3_600_000), "5小时");
+        assert_eq!(fmt_countdown_compact(3 * 86_400_000), "3.0天");
+        assert_eq!(fmt_countdown_compact(-5_000), "0秒");
+    }
+
+    /// 造一个只填判定 / ETA 相关字段的窗口视图。
+    fn test_window(key: &str, window_ms: Option<i64>) -> WindowView {
+        WindowView {
+            key: key.to_string(),
+            label: String::new(),
+            kind: "TOKENS_LIMIT".to_string(),
+            used_percent: 30.0,
+            used: None,
+            total: None,
+            remaining: None,
+            next_reset_ms: None,
+            window_ms,
+            key_count: 1,
+            per_key: Vec::new(),
+            rate: None,
+        }
+    }
+
+    #[test]
+    fn primary_window_classification() {
+        // 5 小时档（unit 3 / 时长 ≤6h）是主窗口。
+        let mut w = test_window("TOKENS_LIMIT:3", Some(5 * 3_600_000));
+        assert!(is_primary_window(&w));
+        // 时长缺失但 unit 是 3，同样按主窗口处理。
+        w.window_ms = None;
+        assert!(is_primary_window(&w));
+        // 周 / 月等长周期与未知窗口降级为摘要行。
+        assert!(!is_primary_window(&test_window("TOKENS_LIMIT:6", Some(7 * 86_400_000))));
+        assert!(!is_primary_window(&test_window("TIME_LIMIT:5", None)));
+    }
+
+    #[test]
+    fn eta_three_states() {
+        let now = 1_000_000_000_i64;
+        let mut w = test_window("TOKENS_LIMIT:3", Some(5 * 3_600_000));
+        let rate = |per_min: f64, basis: i64, pct: bool| {
+            Some(zcode_model::RateView {
+                unit: "tok/min".to_string(),
+                percent_based: pct,
+                points: Vec::new(),
+                current_per_min: per_min,
+                basis_ms: basis,
+            })
+        };
+        // 没有速率数据 → None。
+        assert!(eta_state(&w, now).is_none());
+        // 速率存在但 basis = 0（统计不出「当前速率」）→ None。
+        w.rate = rate(100.0, 0, false);
+        assert!(eta_state(&w, now).is_none());
+        // 有速率但消耗为 0 → Idle（显示「当前无消耗」而不是消失）。
+        w.rate = rate(0.0, 60_000, false);
+        assert!(matches!(eta_state(&w, now), Some(EtaState::Idle)));
+
+        // 剩余 10000，速率 100/min → 100 分钟后用满；重置在 2 小时后 → 正常展示。
+        w.rate = rate(100.0, 60_000, false);
+        w.remaining = Some(10_000.0);
+        w.next_reset_ms = Some(now + 2 * 3_600_000);
+        match eta_state(&w, now) {
+            Some(EtaState::Exhaust { eta_ms, reset_first }) => {
+                assert_eq!(eta_ms, 100 * 60_000);
+                assert!(!reset_first);
+            }
+            other => panic!("expected Exhaust, got {other:?}"),
+        }
+        // 重置 50 分钟后先到 → 数字保留，reset_first 标记弱化展示。
+        w.next_reset_ms = Some(now + 50 * 60_000);
+        match eta_state(&w, now) {
+            Some(EtaState::Exhaust { reset_first, .. }) => assert!(reset_first),
+            other => panic!("expected Exhaust, got {other:?}"),
+        }
+        // 百分比序列没有剩余量数字：用 100% − 已用百分比兜底。
+        w.rate = rate(1.0, 60_000, true); // %/min
+        w.remaining = None;
+        w.used_percent = 70.0; // 剩 30% → 30 分钟
+        w.next_reset_ms = Some(now + 2 * 3_600_000);
+        match eta_state(&w, now) {
+            Some(EtaState::Exhaust { eta_ms, reset_first }) => {
+                assert_eq!(eta_ms, 30 * 60_000);
+                assert!(!reset_first);
+            }
+            other => panic!("expected Exhaust, got {other:?}"),
+        }
+    }
+
+}

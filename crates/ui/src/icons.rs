@@ -5,7 +5,9 @@
 //! 每个图标线宽、风格完全一致（此前混用 emoji 在 Windows 上忽明忽暗、
 //! 部分还是彩色 emoji，和整体风格割裂）。
 
-use egui::{Color32, CornerRadius, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2};
+use egui::{
+    Color32, CornerRadius, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2,
+};
 use zcode_model::KeyStatus;
 
 // ─────────────────────────── 配色（暗色） ───────────────────────────
@@ -77,6 +79,10 @@ pub enum Icon {
     Clock,
     /// 画笔（一键清理）。
     Brush,
+    /// 脉冲折线（消耗速率）。
+    Activity,
+    /// 三角警告（预计用满的紧急警示）。
+    Warning,
 }
 
 /// 24×24 设计网格边长。
@@ -129,8 +135,12 @@ pub fn draw(ui: &Ui, rect: Rect, icon: Icon, color: Color32, stroke_w: f32, rota
             let mut pts = Vec::with_capacity(n * 4 + 1);
             for k in 0..n {
                 let th = k as f32 * step - std::f32::consts::FRAC_PI_2;
-                for (da, r) in [(-a_root, r_root), (-a_tip, r_tip), (a_tip, r_tip), (a_root, r_root)]
-                {
+                for (da, r) in [
+                    (-a_root, r_root),
+                    (-a_tip, r_tip),
+                    (a_tip, r_tip),
+                    (a_root, r_root),
+                ] {
                     pts.push(c + v((th + da).cos(), (th + da).sin()) * r);
                 }
             }
@@ -243,6 +253,23 @@ pub fn draw(ui: &Ui, rect: Rect, icon: Icon, color: Color32, stroke_w: f32, rota
             line(&[v(13.8, 15.4), v(16.4, 12.8)]);
             p.add(Shape::circle_stroke(map(v(7.6, 17.6)), 3.5 * s.x, st));
         }
+        Icon::Activity => {
+            // Lucide activity：心电脉冲，中间尖峰两侧缓坡。
+            line(&[
+                v(3.0, 12.0),
+                v(7.0, 12.0),
+                v(10.0, 5.0),
+                v(14.0, 19.0),
+                v(17.0, 12.0),
+                v(21.0, 12.0),
+            ]);
+        }
+        Icon::Warning => {
+            // Lucide alert-triangle：闭合三角 + 竖线 + 圆点。
+            line(&[v(12.0, 3.5), v(21.0, 19.0), v(3.0, 19.0), v(12.0, 3.5)]);
+            line(&[v(12.0, 9.0), v(12.0, 14.0)]);
+            p.add(Shape::circle_filled(map(v(12.0, 17.2)), 0.75 * s.x, color));
+        }
     }
 }
 
@@ -261,7 +288,11 @@ pub fn pill_button(
     spin: bool,
 ) -> Response {
     let font = egui::TextStyle::Button.resolve(ui.style());
-    let text_color = if primary && enabled { ON_ACCENT } else { TEXT_HI };
+    let text_color = if primary && enabled {
+        ON_ACCENT
+    } else {
+        TEXT_HI
+    };
     let galley = ui
         .fonts(|f| f.layout_no_wrap(label.to_owned(), font, text_color))
         .clone();
@@ -270,13 +301,21 @@ pub fn pill_button(
     let pad = 12.0;
     let gap = 6.0;
     let w = pad + icon_sz + gap + galley.size().x + pad;
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), sense);
     let hovered = enabled && resp.hovered();
 
     let (bg, border, fg) = if primary {
         if !enabled {
-            (ACCENT.gamma_multiply(0.35), ACCENT.gamma_multiply(0.3), ON_ACCENT)
+            (
+                ACCENT.gamma_multiply(0.35),
+                ACCENT.gamma_multiply(0.3),
+                ON_ACCENT,
+            )
         } else if hovered {
             (ACCENT_HOVER, ACCENT_HOVER, ON_ACCENT)
         } else {
@@ -305,7 +344,10 @@ pub fn pill_button(
     } else {
         0.0
     };
-    let ir = Rect::from_min_size(pos2(rect.left() + pad, rect.center().y - icon_sz / 2.0), Vec2::splat(icon_sz));
+    let ir = Rect::from_min_size(
+        pos2(rect.left() + pad, rect.center().y - icon_sz / 2.0),
+        Vec2::splat(icon_sz),
+    );
     draw(ui, ir, icon, fg, 2.0, angle);
     let tp = pos2(
         rect.left() + pad + icon_sz + gap,
@@ -333,11 +375,7 @@ pub fn icon_toggle(ui: &mut Ui, icon: Icon, active: bool, tooltip: &str) -> Resp
             TEXT_HI,
         )
     } else {
-        (
-            Color32::TRANSPARENT,
-            Stroke::NONE,
-            TEXT_MID,
-        )
+        (Color32::TRANSPARENT, Stroke::NONE, TEXT_MID)
     };
     ui.painter().rect(
         rect,
@@ -404,7 +442,10 @@ pub fn status_chip(ui: &mut Ui, status: KeyStatus) {
         Stroke::new(1.0, color.gamma_multiply(0.35)),
         egui::StrokeKind::Middle,
     );
-    let dr = Rect::from_min_size(pos2(rect.left() + pad, rect.center().y - dot / 2.0), Vec2::splat(dot));
+    let dr = Rect::from_min_size(
+        pos2(rect.left() + pad, rect.center().y - dot / 2.0),
+        Vec2::splat(dot),
+    );
     status_glyph(ui, dr, status, color);
     let tp = pos2(
         rect.left() + pad + dot + gap,

@@ -3,20 +3,32 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, RwLock, Semaphore};
 use zcode_model::{
     AccountRecord, AccountView, AddKeyRequest, AppState, EventItem, KeyRecord, KeyRuntime,
-    KeyStatus, KeyView, MoveKeyRequest, QuotaSnapshot, Settings, UpdateKeyRequest,
-    WindowKeyPercent, WindowView, mask_secret, normalize_percent, window_duration_ms, window_meta,
+    KeyStatus, KeyView, MoveKeyRequest, QuotaSnapshot, RateView, Settings, UpdateKeyRequest,
+    WindowKeyPercent, WindowView, mask_secret, normalize_percent, rate_unit_label,
+    window_duration_ms, window_meta,
 };
 
 use crate::client::{self, FailureKind};
-use crate::store::{PersistedState, Store, new_account_id, new_key_id};
+use crate::rate;
+use crate::store::{History, PersistedState, Store, new_account_id, new_key_id};
 use crate::util::{now_ms, trim_opt};
 
 /// 事件环形缓冲上限。
 const MAX_EVENTS: usize = 60;
+
+/// 历史文件写节流间隔：每个 key 刷新完都会走一次持久化，但历史文件
+/// （最多几百 KB）不值得跟着每分钟重写好几遍——脏了也至少隔 60 秒落一次盘。
+const HISTORY_SAVE_THROTTLE: Duration = Duration::from_secs(60);
+
+/// 百分比速率序列在 history 里的键后缀（`KIND:unit#pct`）：
+/// 上游不给数值用量的窗口（实测 5 小时 Token 窗口）按百分比差分采样，
+/// 后缀把两种量纲的序列彻底隔开，永不相混。
+const PCT_SERIES_SUFFIX: &str = "#pct";
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -28,6 +40,11 @@ struct Inner {
     refreshing: HashSet<String>,
     events: VecDeque<EventItem>,
     event_seq: u64,
+    /// 消耗速率的采样历史（独立文件持久化）。
+    history: History,
+    /// 历史有新采样待落盘。
+    history_dirty: bool,
+    history_saved_at: Option<Instant>,
 }
 
 /// 桌面通知出口：`(标题, 正文)`。由界面层注册（Windows 上走托盘气泡，
@@ -75,11 +92,20 @@ impl Manager {
             );
         }
 
+        // 速率采样历史：清掉死 key 的序列与超龄采样，真的动了数据就回写一次。
+        let mut history = store.load_history().await;
+        let live_ids: HashSet<&str> = persisted.keys.iter().map(|k| k.id.as_str()).collect();
+        let history_changed = history.sanitize(&live_ids, now_ms());
+        if history_changed && let Err(err) = store.save_history(&history).await {
+            tracing::warn!(error = %err, "速率历史迁移落库失败");
+        }
+
         let inner = Inner {
             keys: persisted.keys,
             accounts: persisted.accounts,
             runtime,
             settings: persisted.settings,
+            history,
             ..Default::default()
         };
 
@@ -148,6 +174,48 @@ impl Manager {
         };
         if let Err(err) = self.store.save(&snapshot).await {
             tracing::warn!(error = %err, "状态持久化失败");
+        }
+        self.flush_history().await;
+    }
+
+    /// 节流落盘速率历史：脏且距上次写入超过阈值才写。
+    ///
+    /// 标志在取快照时即复位、写失败再置回：写盘期间新到的采样只会把
+    /// 标志重新拉起，不会丢。
+    async fn flush_history(&self) {
+        let snapshot = {
+            let mut guard = self.inner.write().await;
+            if !guard.history_dirty {
+                return;
+            }
+            if guard
+                .history_saved_at
+                .is_some_and(|at| at.elapsed() < HISTORY_SAVE_THROTTLE)
+            {
+                return;
+            }
+            guard.history_dirty = false;
+            guard.history_saved_at = Some(Instant::now());
+            guard.history.clone()
+        };
+        if let Err(err) = self.store.save_history(&snapshot).await {
+            tracing::warn!(error = %err, "速率历史持久化失败");
+            self.inner.write().await.history_dirty = true;
+        }
+    }
+
+    /// 立即落盘速率历史（无视节流）。退出前 / 测试断言前调用，
+    /// 把最近 60 秒节流窗口内的采样抢救到磁盘。
+    pub async fn persist_history_now(&self) {
+        let snapshot = {
+            let mut guard = self.inner.write().await;
+            guard.history_dirty = false;
+            guard.history_saved_at = Some(Instant::now());
+            guard.history.clone()
+        };
+        if let Err(err) = self.store.save_history(&snapshot).await {
+            tracing::warn!(error = %err, "速率历史持久化失败");
+            self.inner.write().await.history_dirty = true;
         }
     }
 
@@ -280,6 +348,9 @@ impl Manager {
             let before = guard.keys.len();
             guard.keys.retain(|k| k.id != id);
             guard.runtime.remove(id);
+            if guard.history.series.remove(id).is_some() {
+                guard.history_dirty = true;
+            }
             guard.keys.len() != before
         };
         if removed {
@@ -310,6 +381,9 @@ impl Manager {
                 .collect();
             for kid in &ids {
                 guard.runtime.remove(kid);
+                if guard.history.series.remove(kid).is_some() {
+                    guard.history_dirty = true;
+                }
             }
             guard.keys.retain(|k| k.account_id.as_deref() != Some(id));
             guard.accounts.retain(|a| a.id != id);
@@ -341,6 +415,9 @@ impl Manager {
                 .collect();
             for kid in &ids {
                 guard.runtime.remove(kid);
+                if guard.history.series.remove(kid).is_some() {
+                    guard.history_dirty = true;
+                }
             }
             let before = guard.keys.len();
             guard.keys.retain(|k| !ids.contains(&k.id));
@@ -741,6 +818,9 @@ impl Manager {
             let mut new_account_id: Option<String> = None;
             let mut new_error: Option<String> = None;
             let mut new_status = previous;
+            // 本轮要归档的速率采样：(窗口标识, 已用量)，成功快照才有。
+            let mut new_samples: Vec<(String, f64)> = Vec::new();
+            let mut new_fetched_at = 0_i64;
 
             match result {
                 RefreshResult::Skipped => {
@@ -766,6 +846,23 @@ impl Manager {
                         rt.cooling_until_ms = None;
                         rt.fail_streak = 0;
                         new_error = None;
+                        // 速率采样：优先数值用量（currentValue 口径）；
+                        // 上游不给数值的窗口（实测 5 小时 Token 窗口）退回
+                        // 百分比差分，序列键加 `#pct` 后缀与数值序列隔离，
+                        // 两种量纲永不相混。
+                        new_fetched_at = outcome.snapshot.fetched_at_ms;
+                        for limit in &outcome.snapshot.limits {
+                            let (wkey, _, _) = window_meta(&limit.kind, limit.unit);
+                            match limit.current_value.or(limit.used) {
+                                Some(v) => new_samples.push((wkey, v)),
+                                None => {
+                                    if let Some(pct) = limit.percentage.map(normalize_percent) {
+                                        new_samples
+                                            .push((format!("{wkey}{PCT_SERIES_SUFFIX}"), pct));
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         let failure = outcome.failure.unwrap_or(FailureKind::Parse);
                         // 无 plan 是明确的中性状态：不进入错误、不重试、不冷却。
@@ -804,6 +901,19 @@ impl Manager {
             }
             if let Some(rt) = guard.runtime.get_mut(key_id) {
                 rt.status = new_status;
+            }
+
+            // 采样归档（在 runtime 借用结束之后写 history，避免可变借用冲突）。
+            for (wkey, used) in new_samples {
+                let series = guard
+                    .history
+                    .series
+                    .entry(key_id.to_string())
+                    .or_default()
+                    .entry(wkey)
+                    .or_default();
+                rate::record(series, new_fetched_at, used, now_ms());
+                guard.history_dirty = true;
             }
 
             if new_status == KeyStatus::Error && previous != KeyStatus::Error {
@@ -934,7 +1044,15 @@ impl Manager {
                     })
                     .collect();
 
-                let windows = aggregate_windows(&keys);
+                let mut windows = aggregate_windows(&keys);
+                // 速率：同一批 key 的采样历史 → 曲线 + 当前速率。
+                let key_ids: Vec<&str> = keys.iter().map(|k| k.id.as_str()).collect();
+                attach_rates(
+                    &mut windows,
+                    &guard.history,
+                    &key_ids,
+                    guard.settings.refresh_interval_secs,
+                );
                 let next_reset_ms = pick_next_reset(&windows, now);
                 let status = worst_status(&keys.iter().map(|k| k.status).collect::<Vec<_>>());
                 let last_checked_ms = keys.iter().filter_map(|k| k.last_checked_ms).max();
@@ -1126,6 +1244,7 @@ fn aggregate_windows(keys: &[KeyView]) -> Vec<WindowView> {
             window_ms: agg.window_ms,
             key_count: agg.per_key.len(),
             per_key: agg.per_key,
+            rate: None,
         })
         .collect();
     windows.sort_by_key(|w| window_meta(&w.kind, parse_unit_from_key(w.key.as_str())).2);
@@ -1136,6 +1255,85 @@ fn aggregate_windows(keys: &[KeyView]) -> Vec<WindowView> {
 fn parse_unit_from_key(key: &str) -> Option<u32> {
     key.rsplit_once(':')
         .and_then(|(_, unit)| unit.parse::<u32>().ok())
+}
+
+/// 把采样历史换算成速率，附着到账户的每个窗口视图上。
+///
+/// 序列按 key 存（key 移动账户时历史跟着走），同账户多 key 共享额度池、
+/// 序列内容相同——挑「采样最新（其次最多）」的一条作代表，避免拼接出
+/// 零间隔的重复点。数值序列（`KIND:unit`）优先于百分比序列
+/// （`KIND:unit#pct`），后者只在上游不给数值用量时兜底。
+fn attach_rates(
+    windows: &mut [WindowView],
+    history: &History,
+    key_ids: &[&str],
+    refresh_interval_secs: u64,
+) {
+    // 当前速率的回溯跨度随刷新间隔伸缩：间隔 60s → 回看 5 分钟；
+    // 间隔 15m → 回看 30 分钟（上限，再长就不是「瞬时」了）。
+    let eff_refresh_ms = (if refresh_interval_secs > 0 {
+        refresh_interval_secs
+    } else {
+        60
+    } as i64)
+        * 1000;
+    let min_span_ms = eff_refresh_ms.min(60_000);
+    let max_span_ms = (eff_refresh_ms * 5).clamp(10 * 60_000, 30 * 60_000);
+
+    for w in windows.iter_mut() {
+        let pct_key = format!("{}{PCT_SERIES_SUFFIX}", w.key);
+        let mut best: Option<(&Vec<zcode_model::RateSample>, bool, i64, usize)> = None;
+        // 数值序列先看，百分比序列兜底；两类都挑采样最新的一条。
+        for (series_key, percent_based) in [(w.key.as_str(), false), (pct_key.as_str(), true)] {
+            for kid in key_ids {
+                let Some(series) = history.series.get(*kid).and_then(|m| m.get(series_key)) else {
+                    continue;
+                };
+                let Some(last) = series.last() else { continue };
+                let better = match &best {
+                    None => true,
+                    Some((_, best_pct, best_t, best_len)) => {
+                        if percent_based != *best_pct {
+                            !percent_based // 数值序列永远优先于百分比序列
+                        } else {
+                            last.t_ms > *best_t
+                                || (last.t_ms == *best_t && series.len() > *best_len)
+                        }
+                    }
+                };
+                if better {
+                    best = Some((series, percent_based, last.t_ms, series.len()));
+                }
+            }
+        }
+        let Some((series, percent_based, _, _)) = best else {
+            continue;
+        };
+        let points = rate::compute_points(series);
+        // 百分比是整数刻度的粗量化信号：把当前速率的统计跨度拉长
+        // （至少 10 分钟），单次 1% 台阶才不会被放大成离谱的瞬时值。
+        let (min_span, max_span) = if percent_based {
+            (min_span_ms.max(10 * 60_000), max_span_ms.max(20 * 60_000))
+        } else {
+            (min_span_ms, max_span_ms)
+        };
+        let current = rate::current_rate(series, min_span, max_span);
+        if points.is_empty() && current.is_none() {
+            continue;
+        }
+        let unit = if percent_based {
+            "%/h"
+        } else {
+            rate_unit_label(&w.kind)
+        };
+        w.rate = Some(RateView {
+            unit: unit.to_string(),
+            percent_based,
+            current_per_min: current.map(|c| c.0).unwrap_or(0.0),
+            basis_ms: current.map(|c| c.1).unwrap_or(0),
+            points,
+        });
+    }
 }
 
 /// 在窗口列表中挑出最近的一次刷新时间：优先未来的，全过期则取最早的。

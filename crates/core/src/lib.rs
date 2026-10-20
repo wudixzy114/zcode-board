@@ -6,6 +6,7 @@ pub mod app;
 pub mod autostart;
 pub mod client;
 pub mod discover;
+pub mod rate;
 pub mod scheduler;
 pub mod store;
 pub mod util;

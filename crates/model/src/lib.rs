@@ -154,6 +154,45 @@ pub struct KeyRuntime {
     pub fail_streak: u32,
 }
 
+// ────────────────────────────── 速率采样 ──────────────────────────────
+
+/// 一次用量采样（持久化）：某 key 某窗口在时刻 `t_ms` 的已用量。
+///
+/// 速率 = 相邻两次采样 的用量差 / 时间差，
+/// 因此只存这两个字段就是全部所需，历史文件保持最小体积。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RateSample {
+    pub t_ms: i64,
+    /// 已用量的原始数值（token 数 / 调用次数），与上游 `currentValue` 同口径。
+    pub used: f64,
+}
+
+/// 速率曲线上的一个点：时刻 `t_ms` 区间末端的瞬时速率（每分钟用量）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RatePoint {
+    pub t_ms: i64,
+    /// 每分钟用量（token/分钟 或 次/分钟）。
+    pub per_min: f64,
+}
+
+/// 附着在窗口视图上的速率信息，前端据此绘制「区间内速率变化」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateView {
+    /// 速率单位的人类可读名（`tok/min`、`次/min`，或百分比窗口的 `%/h`）。
+    pub unit: String,
+    /// 序列是否基于百分比差分（上游不给数值用量的窗口，实测即 5 小时
+    /// Token 窗口）：内部速率仍是「每分钟」，展示按小时放大到 `%/h`。
+    #[serde(default)]
+    pub percent_based: bool,
+    /// 采样出的速率序列（时间升序），前端按所选区间过滤后绘图。
+    pub points: Vec<RatePoint>,
+    /// 当前速率：以最近一次采样为锚、向前回溯一段的 平均
+    /// 用量差分，比单区间差分更能抵抗上游数值的阶梯量化。
+    pub current_per_min: f64,
+    /// 当前速率的统计跨度（毫秒），前端展示「近 X 分钟」时使用。
+    pub basis_ms: i64,
+}
+
 // ────────────────────────────── 前端视图 ──────────────────────────────
 
 /// 配额窗口视图：一个账户下所有 key 的同类型窗口聚合后的展示单元。
@@ -180,6 +219,9 @@ pub struct WindowView {
     pub key_count: usize,
     /// 各 key 的百分比明细（用于展开查看）。
     pub per_key: Vec<WindowKeyPercent>,
+    /// 消耗速率（有 ≥2 个采样点时才有）。
+    #[serde(default)]
+    pub rate: Option<RateView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,11 +316,19 @@ pub struct Settings {
     /// 点关闭按钮时最小化到托盘而不是退出。
     #[serde(default = "default_true")]
     pub minimize_to_tray: bool,
+    /// 速率图表的回看区间（秒）；0 表示「全部历史」。
+    #[serde(default = "default_rate_span_secs")]
+    pub rate_span_secs: u64,
 }
 
 /// 新功能的默认值：默认开启（老配置文件没有这两个字段时也希望是开的）。
 fn default_true() -> bool {
     true
+}
+
+/// 速率区间默认 1 小时：短区间看不出趋势，长区间淹没有意思的近期变化。
+fn default_rate_span_secs() -> u64 {
+    3600
 }
 
 impl Default for Settings {
@@ -295,6 +345,7 @@ impl Default for Settings {
             extra_headers: String::new(),
             start_with_windows: true,
             minimize_to_tray: true,
+            rate_span_secs: 3600,
         }
     }
 }
@@ -412,9 +463,45 @@ pub fn window_duration_ms(_kind: &str, unit: Option<u32>) -> Option<i64> {
     }
 }
 
-/// 上游百分比可能是 0–100 或 0–1，统一归一到 0–100。
+/// 速率单位：Token 窗口按 token/分钟，调用窗口按次/分钟。
+pub fn rate_unit_label(kind: &str) -> &'static str {
+    match kind {
+        "TOKENS_LIMIT" => "tok/min",
+        "TIME_LIMIT" => "次/min",
+        _ => "u/min",
+    }
+}
+
+/// 速率数值的中文习惯格式化：大数用「万 / 亿」，小数保留有效位。
+///
+/// 例：`1234.0 → "1234"`、`23456.0 → "2.3万"`、`3.25 → "3.25"`、`0 → "0"`。
+pub fn format_rate(v: f64) -> String {
+    if !v.is_finite() {
+        return "—".to_string();
+    }
+    if v <= 0.0 {
+        return "0".to_string();
+    }
+    if v >= 1e8 {
+        format!("{:.1}亿", v / 1e8)
+    } else if v >= 1e4 {
+        format!("{:.1}万", v / 1e4)
+    } else if v >= 100.0 {
+        format!("{}", v.round() as i64)
+    } else if v >= 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// 上游百分比可能是 0–100 或 0–1 小数，统一归一到 0–100。
+///
+/// 边界 `1.0` 按 0–100 刻度理解为 1%：实测上游（z.ai quota/limit）返回整数
+/// 百分比（如 4 表示 4%），窗口刚重置后长时间停在 1%，若当作 0–1 小数放大
+/// 会显示成 100%。只有严格小于 1 的小数才按比例放大。
 pub fn normalize_percent(raw: f64) -> f64 {
-    if raw > 0.0 && raw <= 1.0 {
+    if raw > 0.0 && raw < 1.0 {
         raw * 100.0
     } else {
         raw
@@ -453,6 +540,10 @@ mod tests {
         assert_eq!(normalize_percent(0.42), 42.0);
         assert_eq!(normalize_percent(42.0), 42.0);
         assert_eq!(normalize_percent(120.0), 100.0);
+        // 整数刻度的 1% 不能被放大成 100%（窗口刚重置时长时间停在这里）。
+        assert_eq!(normalize_percent(1.0), 1.0);
+        assert_eq!(normalize_percent(0.0), 0.0);
+        assert_eq!(normalize_percent(0.005), 0.5);
     }
 
     #[test]
@@ -479,9 +570,26 @@ mod tests {
         let settings: Settings = serde_json::from_str(json).expect("解析旧配置");
         assert!(settings.start_with_windows, "开机启动默认应开启");
         assert!(settings.minimize_to_tray, "最小化到托盘默认应开启");
+        // 速率区间同样有回填默认（1 小时），老配置升级即有图可看。
+        assert_eq!(settings.rate_span_secs, 3600);
+        assert_eq!(Settings::default().rate_span_secs, 3600);
+    }
 
-        // 新裝默认值同样开启。
-        assert!(Settings::default().start_with_windows);
-        assert!(Settings::default().minimize_to_tray);
+    #[test]
+    fn rate_formatting() {
+        assert_eq!(format_rate(0.0), "0");
+        assert_eq!(format_rate(3.249), "3.25");
+        assert_eq!(format_rate(12.34), "12.3");
+        assert_eq!(format_rate(830.6), "831");
+        assert_eq!(format_rate(23_456.0), "2.3万");
+        assert_eq!(format_rate(123_456_789.0), "1.2亿");
+        assert_eq!(format_rate(f64::NAN), "—");
+    }
+
+    #[test]
+    fn rate_unit_kinds() {
+        assert_eq!(rate_unit_label("TOKENS_LIMIT"), "tok/min");
+        assert_eq!(rate_unit_label("TIME_LIMIT"), "次/min");
+        assert_eq!(rate_unit_label("WHATEVER"), "u/min");
     }
 }
