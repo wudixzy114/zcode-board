@@ -1253,6 +1253,8 @@ fn parse_unit_from_key(key: &str) -> Option<u32> {
 /// 序列内容相同——挑「采样最新（其次最多）」的一条作代表，避免拼接出
 /// 零间隔的重复点。数值序列（`KIND:unit`）优先于百分比序列
 /// （`KIND:unit#pct`），后者只在上游不给数值用量时兜底。
+/// 展示统一走百分比口径（%/h）：百分比序列天然如此，数值序列在总量
+/// 已知时于视图层换算——原始单位的每分钟速率刷新间隔大时长期贴 0。
 fn attach_rates(
     windows: &mut [WindowView],
     history: &History,
@@ -1296,13 +1298,23 @@ fn attach_rates(
                 }
             }
         }
-        let Some((series, percent_based, _, _)) = best else {
+        let Some((series, series_pct, _, _)) = best else {
             continue;
         };
         let points = rate::compute_points(series);
-        // 百分比是整数刻度的粗量化信号：把当前速率的统计跨度拉长
-        // （至少 10 分钟），单次 1% 台阶才不会被放大成离谱的瞬时值。
-        let (min_span, max_span) = if percent_based {
+
+        // 总量已知的数值序列换算成百分比口径展示：%/h 直接回答「按这个
+        // 节奏到重置够不够用」，而原始单位（额度点数/调用次数/Token 数）
+        // 的每分钟速率在刷新间隔较大时长期贴着 0，没有参考意义。
+        // 采样仍存数值序列（比上游的整数百分比精细得多），只在视图换算。
+        let display_pct_scale = match w.total {
+            Some(t) if !series_pct && t > 0.0 => Some(100.0 / t),
+            _ => None,
+        };
+        // 百分比口径（序列本身就是百分比、或数值换算）统一用更长统计
+        // 跨度：既抵抗整数百分比的粗量化台阶，也让「当前速率」是十分钟
+        // 级的平均而不是随每次刷新跳变。
+        let (min_span, max_span) = if series_pct || display_pct_scale.is_some() {
             (min_span_ms.max(10 * 60_000), max_span_ms.max(20 * 60_000))
         } else {
             (min_span_ms, max_span_ms)
@@ -1311,15 +1323,24 @@ fn attach_rates(
         if points.is_empty() && current.is_none() {
             continue;
         }
-        let unit = if percent_based {
-            "%/h"
+        let percent_display = series_pct || display_pct_scale.is_some();
+        let (unit, percent_based) = if percent_display {
+            ("%/h".to_string(), true)
         } else {
-            rate_unit_label(&w.kind)
+            (rate_unit_label(&w.kind).to_string(), false)
         };
+        let mut points = points;
+        let mut current_per_min = current.map(|c| c.0).unwrap_or(0.0);
+        if let Some(scale) = display_pct_scale {
+            for p in &mut points {
+                p.per_min *= scale;
+            }
+            current_per_min *= scale;
+        }
         w.rate = Some(RateView {
-            unit: unit.to_string(),
+            unit,
             percent_based,
-            current_per_min: current.map(|c| c.0).unwrap_or(0.0),
+            current_per_min,
             basis_ms: current.map(|c| c.1).unwrap_or(0),
             points,
         });

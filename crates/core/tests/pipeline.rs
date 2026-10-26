@@ -808,19 +808,23 @@ async fn rate_accumlates_across_refreshes_and_survives_restart() {
         let view = manager.view().await;
         let windows = &view.accounts[0].windows;
 
-        // 月度调用窗口：数值序列 → 次/min，量级 ~3000/min。
+        // 月度调用窗口：数值序列但总量已知 → 换算成百分比口径，单位 %/h。
         let monthly = windows
             .iter()
             .find(|w| w.kind == "TIME_LIMIT")
             .expect("应有月度调用窗口");
         let rate = monthly.rate.as_ref().expect("月度窗口应有速率");
-        assert_eq!(rate.unit, "次/min");
-        assert!(!rate.percent_based);
-        assert!(!rate.points.is_empty(), "两次采样至少产出一个速率点");
-        // 两次请求相隔 ~5.5s、用量差 300 → 速率约 3000/min，放宽到 > 1000 防计时抖动。
+        assert_eq!(rate.unit, "%/h");
         assert!(
-            rate.points.iter().all(|p| p.per_min > 1000.0),
-            "速率点应为正且量级正确: {:?}",
+            rate.percent_based,
+            "总量已知的数值序列应换算成百分比口径展示"
+        );
+        assert!(!rate.points.is_empty(), "两次采样至少产出一个速率点");
+        // 两次请求相隔 ~5.5s、用量差 300、总量 100000 → 每分钟 0.3%，
+        // 放宽到 > 0.1 防计时抖动（换算前的数值速率约 3000/min）。
+        assert!(
+            rate.points.iter().all(|p| p.per_min > 0.1),
+            "速率点应为正且换算量级正确: {:?}",
             rate.points
         );
 

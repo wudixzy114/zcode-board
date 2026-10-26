@@ -1540,11 +1540,16 @@ fn eta_state(w: &WindowView, now_ms: i64) -> Option<EtaState> {
     if rate.current_per_min <= 0.0 {
         return Some(EtaState::Idle);
     }
-    // 百分比序列没有「剩余量」数字，用 100% − 已用百分比 兜底。
-    let remaining = match w.remaining {
-        Some(r) => r,
-        None if rate.percent_based => (100.0 - w.used_percent).max(0.0),
-        None => return None,
+    // 百分比口径的速率（上游只给百分比的窗口，以及数值换算成百分比
+    // 展示的窗口）统一用 100% − 已用百分比 作剩余量——数值剩余量与
+    // 百分比速率混用会算出错误的外推时间。
+    let remaining = if rate.percent_based {
+        (100.0 - w.used_percent).max(0.0)
+    } else {
+        match w.remaining {
+            Some(r) => r,
+            None => return None,
+        }
     };
     if remaining <= 0.0 {
         return None;

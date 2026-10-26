@@ -180,8 +180,9 @@ pub struct RatePoint {
 pub struct RateView {
     /// 速率单位的人类可读名（`tok/min`、`次/min`，或百分比窗口的 `%/h`）。
     pub unit: String,
-    /// 序列是否基于百分比差分（上游不给数值用量的窗口，实测即 5 小时
-    /// Token 窗口）：内部速率仍是「每分钟」，展示按小时放大到 `%/h`。
+    /// 序列是否以百分比口径展示（内部速率仍是「每分钟」，展示按小时
+    /// 放大到 `%/h`）：包括上游只给百分比的窗口（实测 5 小时 Token
+    /// 窗口），以及总量已知、由数值序列换算的窗口（调用 / 额度窗口）。
     #[serde(default)]
     pub percent_based: bool,
     /// 采样出的速率序列（时间升序），前端按所选区间过滤后绘图。
@@ -472,8 +473,9 @@ pub fn window_duration_ms(_kind: &str, unit: Option<u32>) -> Option<i64> {
     }
 }
 
-/// 速率单位：Token 窗口按 token/分钟，调用窗口按次/分钟，额度窗口按点数/分钟。
-pub fn rate_unit_label(kind: &str) -> &'static str {
+    /// 速率单位的人类可读名。展示统一走 %/h（百分比序列、以及总量已知的
+    /// 数值序列换算）；本函数只服务无总量可换算的兜底窗口。
+    pub fn rate_unit_label(kind: &str) -> &'static str {
     match kind {
         "TOKENS_LIMIT" => "tok/min",
         "TIME_LIMIT" => "次/min",
