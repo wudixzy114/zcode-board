@@ -107,6 +107,14 @@ pub fn scan() -> Discovery {
     out.dedup()
 }
 
+/// 视为 API key 的 access 类型。
+///
+/// - `api-key`：普通 BigModel API key；
+/// - `zhipu-coding-plan-api-key`：zcode 里配 coding plan 时写入的类型，
+///   结构与普通 key 相同（`config.access.apiKey`），甚至可能是同一个 secret——
+///   同一 secret 挂多个 provider 时由 `dedup()` 合并。
+const API_KEY_TYPES: [&str; 2] = ["api-key", "zhipu-coding-plan-api-key"];
+
 /// 解析 `provider_config.json` 的 providerRules。
 ///
 /// 结构：`config.providerConfigRules.providerRules[]`
@@ -127,8 +135,9 @@ fn scan_provider_config(json: &Value, out: &mut Discovery) {
         let Some(access) = rule.get("config").and_then(|c| c.get("access")) else {
             continue;
         };
-        // 只取 api-key 类型的 access
-        if !matches!(access.get("type").and_then(|v| v.as_str()), Some("api-key")) {
+        // 只取 API key 类型的 access（普通 key 与 coding plan key 都算）
+        let access_type = access.get("type").and_then(|v| v.as_str());
+        if !API_KEY_TYPES.contains(&access_type.unwrap_or_default()) {
             continue;
         }
         let Some(api_key) = access.get("apiKey").and_then(|v| v.as_str()) else {
@@ -184,7 +193,9 @@ mod tests {
                             {"providerId":"bigmodel-standard-api","providerName":"BigModel API",
                              "config":{"access":{"type":"api-key","apiKey":"aaaa.bbbb"}}},
                             {"providerId":"bigmodel-standard-api-2","providerName":"BigModel API 2",
-                             "config":{"access":{"type":"api-key","apiKey":"cccc.dddd"}}}
+                             "config":{"access":{"type":"api-key","apiKey":"cccc.dddd"}}},
+                            {"providerId":"bigmodel-api-2","providerName":"BigModel Coding Plan 2",
+                             "config":{"access":{"type":"zhipu-coding-plan-api-key","apiKey":"eeee.ffff"}}}
                         ]
                     }
                 }
@@ -195,11 +206,13 @@ mod tests {
         let mut out = Discovery::default();
         scan_provider_config(&json, &mut out);
 
-        assert_eq!(out.keys.len(), 2);
+        assert_eq!(out.keys.len(), 3);
         assert_eq!(out.keys[0].label, "BigModel API");
         assert_eq!(out.keys[0].secret, "aaaa.bbbb");
         assert_eq!(out.keys[0].group, "zcode-provider:bigmodel-standard-api");
         assert_eq!(out.keys[1].label, "BigModel API 2");
+        assert_eq!(out.keys[2].label, "BigModel Coding Plan 2");
+        assert_eq!(out.keys[2].secret, "eeee.ffff");
     }
 
     #[test]
@@ -223,6 +236,37 @@ mod tests {
 
         assert_eq!(out.keys.len(), 1, "只应保留有效 api-key");
         assert_eq!(out.keys[0].secret, "real.key");
+    }
+
+    #[test]
+    fn dedup_merges_same_secret_across_types() {
+        // 同一 secret 既是普通 API key 又是 coding plan key（挂在不同 provider 下）：
+        // 两种类型都要扫出来，再去重保留先出现的一条。
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+                "config": {"providerConfigRules": {"providerRules": [
+                    {"providerId":"bigmodel-standard-api","providerName":"BigModel API",
+                     "config":{"access":{"type":"api-key","apiKey":"key.one"}}},
+                    {"providerId":"bigmodel-standard-api-2","providerName":"BigModel API 2",
+                     "config":{"access":{"type":"api-key","apiKey":"key.two"}}},
+                    {"providerId":"bigmodel-api","providerName":"BigModel Coding Plan",
+                     "config":{"access":{"type":"zhipu-coding-plan-api-key","apiKey":"key.two"}}},
+                    {"providerId":"bigmodel-api-2","providerName":"BigModel Coding Plan 2",
+                     "config":{"access":{"type":"zhipu-coding-plan-api-key","apiKey":"key.three"}}}
+                ]}}
+            }"#,
+        )
+        .unwrap();
+
+        let mut out = Discovery::default();
+        scan_provider_config(&json, &mut out);
+        let out = out.dedup();
+
+        assert_eq!(out.keys.len(), 3);
+        assert_eq!(
+            out.keys.iter().map(|k| k.secret.as_str()).collect::<Vec<_>>(),
+            ["key.one", "key.two", "key.three"]
+        );
     }
 
     #[test]
