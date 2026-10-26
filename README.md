@@ -42,7 +42,9 @@ zcode 界面只显示 token plan，不显示 API Key 的额度——这个工具
 
 实测本机数据：`BigModel API`（第 1 个）返回「不存在 coding plan」，而 `BigModel API 2~5`
 都能查到 `月度调用窗口 184/4000`、`5 小时 Token 窗口` 及按模型的用量明细
-（search-prime 141 / web-reader 43 / zread 0）。
+（search-prime 141 / web-reader 43 / zread 0）。coding plan 独立配 key 的新账号
+返回第三种窗口 `CREDIT_LIMIT`（额度点数），同样按 unit 编码解析：
+`5 小时额度窗口`（unit 3）与 `周额度窗口`（unit 6）。
 
 ### 3. 疑似同一账户自动识别 + 一键合并
 

@@ -45,7 +45,9 @@ async fn spawn_fake_upstream() -> String {
                         r#"{{"success":true,"msg":"","data":{{"limits":[
                             {{"type":"TOKENS_LIMIT","percentage":42.5,"unit":3,"nextResetTime":{five_hour_reset}}},
                             {{"type":"TOKENS_LIMIT","percentage":12.0,"unit":6,"nextResetTime":{week_reset}}},
-                            {{"type":"TIME_LIMIT","unit":5,"number":1,"usage":4000,"currentValue":184,"remaining":3816,"percentage":4,"nextResetTime":{monthly_reset},"usageDetails":[{{"modelCode":"search-prime","usage":141}},{{"modelCode":"web-reader","usage":43}}]}}
+                            {{"type":"TIME_LIMIT","unit":5,"number":1,"usage":4000,"currentValue":184,"remaining":3816,"percentage":4,"nextResetTime":{monthly_reset},"usageDetails":[{{"modelCode":"search-prime","usage":141}},{{"modelCode":"web-reader","usage":43}}]}},
+                            {{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":178,"remaining":27821,"percentage":1,"nextResetTime":{five_hour_reset}}},
+                            {{"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":178,"remaining":139821,"percentage":1,"nextResetTime":{week_reset}}}
                         ]}}}}"#,
                         monthly_reset = now + 29 * 24 * 3_600_000
                     )
@@ -149,7 +151,7 @@ async fn keys_with_same_group_hint_share_account_and_aggregate_windows() {
         account.keys.iter().map(|k| k.status).collect::<Vec<_>>()
     );
 
-    // 窗口聚合：三个窗口（5小时 Token / 周 Token / 月度调用）
+    // 窗口聚合：5小时 Token / 周 Token / 月度调用 / 5小时额度 / 周额度
     let five_hour = account
         .windows
         .iter()
@@ -159,6 +161,14 @@ async fn keys_with_same_group_hint_share_account_and_aggregate_windows() {
         .iter()
         .find(|w| w.kind == "TOKENS_LIMIT" && w.label.contains("周"));
     let monthly = account.windows.iter().find(|w| w.kind == "TIME_LIMIT");
+    let credit_5h = account
+        .windows
+        .iter()
+        .find(|w| w.kind == "CREDIT_LIMIT" && w.key.ends_with(":3"));
+    let credit_week = account
+        .windows
+        .iter()
+        .find(|w| w.kind == "CREDIT_LIMIT" && w.key.ends_with(":6"));
     assert!(
         five_hour.is_some(),
         "应出现 5 小时 Token 窗口: {:?}",
@@ -170,6 +180,23 @@ async fn keys_with_same_group_hint_share_account_and_aggregate_windows() {
         "应出现月度调用窗口: {:?}",
         account.windows
     );
+    // CREDIT_LIMIT：coding plan 额度窗口要有可读标签与完整数字。
+    let credit_5h = credit_5h.expect("应出现 5 小时额度窗口");
+    assert_eq!(credit_5h.label, "5 小时额度窗口");
+    assert_eq!(credit_5h.used, Some(178.0));
+    assert_eq!(credit_5h.total, Some(28000.0));
+    let credit_week = credit_week.expect("应出现周额度窗口");
+    assert_eq!(credit_week.label, "周额度窗口");
+    assert_eq!(credit_week.total, Some(140000.0));
+    // 排序：5 小时档（无论 kind）都排在周档之前。
+    let sort_of = |w: &zcode_model::WindowView, label: &str| {
+        account
+            .windows
+            .iter()
+            .position(|x| x.key == w.key)
+            .unwrap_or_else(|| panic!("窗口 {label} 应在列表中"))
+    };
+    assert!(sort_of(credit_5h, "5h额度") < sort_of(credit_week, "周额度"));
     assert!((five_hour.unwrap().used_percent - 42.5).abs() < 1e-6);
     // 月度窗口应有完整数字
     let monthly = monthly.unwrap();

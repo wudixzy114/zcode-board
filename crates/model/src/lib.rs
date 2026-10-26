@@ -438,6 +438,13 @@ pub fn window_meta(kind: &str, unit: Option<u32>) -> (String, String, u32) {
         ("TIME_LIMIT", Some(6)) => "周调用窗口".to_string(),
         ("TIME_LIMIT", Some(u)) => format!("调用窗口 · unit {u}"),
         ("TIME_LIMIT", None) => "调用窗口".to_string(),
+        // CREDIT_LIMIT 是 coding plan 账户的额度点数窗口（实测新账号返回，
+        // unit 编码与上面一致：3=5 小时、5=月、6=周）
+        ("CREDIT_LIMIT", Some(3)) => "5 小时额度窗口".to_string(),
+        ("CREDIT_LIMIT", Some(5)) => "月度额度窗口".to_string(),
+        ("CREDIT_LIMIT", Some(6)) => "周额度窗口".to_string(),
+        ("CREDIT_LIMIT", Some(u)) => format!("额度窗口 · unit {u}"),
+        ("CREDIT_LIMIT", None) => "额度窗口".to_string(),
         (other, Some(u)) => format!("{other} · unit {u}"),
         (other, None) => other.to_string(),
     };
@@ -446,6 +453,8 @@ pub fn window_meta(kind: &str, unit: Option<u32>) -> (String, String, u32) {
         ("TOKENS_LIMIT", Some(6)) => 1,
         ("TIME_LIMIT", Some(3)) => 2,
         ("TIME_LIMIT", Some(6)) => 3,
+        ("CREDIT_LIMIT", Some(3)) => 4,
+        ("CREDIT_LIMIT", Some(6)) => 5,
         (_, Some(u)) => 10 + u,
         (_, None) => 99,
     };
@@ -463,11 +472,12 @@ pub fn window_duration_ms(_kind: &str, unit: Option<u32>) -> Option<i64> {
     }
 }
 
-/// 速率单位：Token 窗口按 token/分钟，调用窗口按次/分钟。
+/// 速率单位：Token 窗口按 token/分钟，调用窗口按次/分钟，额度窗口按点数/分钟。
 pub fn rate_unit_label(kind: &str) -> &'static str {
     match kind {
         "TOKENS_LIMIT" => "tok/min",
         "TIME_LIMIT" => "次/min",
+        "CREDIT_LIMIT" => "额度/min",
         _ => "u/min",
     }
 }
@@ -590,6 +600,36 @@ mod tests {
     fn rate_unit_kinds() {
         assert_eq!(rate_unit_label("TOKENS_LIMIT"), "tok/min");
         assert_eq!(rate_unit_label("TIME_LIMIT"), "次/min");
+        assert_eq!(rate_unit_label("CREDIT_LIMIT"), "额度/min");
         assert_eq!(rate_unit_label("WHATEVER"), "u/min");
+    }
+
+    #[test]
+    fn window_meta_labels_and_sort() {
+        // 5 小时档窗口：三种 kind 都要有可读名，且排序在最前。
+        let (k, label, sort) = window_meta("TOKENS_LIMIT", Some(3));
+        assert_eq!(label, "5 小时 Token 窗口");
+        assert_eq!(sort, 0);
+        assert!(k.ends_with(":3"));
+
+        assert_eq!(window_meta("TIME_LIMIT", Some(5)).1, "月度调用窗口");
+        assert_eq!(window_meta("TIME_LIMIT", Some(3)).1, "5 小时调用窗口");
+
+        // CREDIT_LIMIT：coding plan 账户的额度点数窗口（实测新账号返回）。
+        assert_eq!(window_meta("CREDIT_LIMIT", Some(3)).1, "5 小时额度窗口");
+        assert_eq!(window_meta("CREDIT_LIMIT", Some(6)).1, "周额度窗口");
+        assert_eq!(window_meta("CREDIT_LIMIT", Some(5)).1, "月度额度窗口");
+        assert_eq!(window_meta("CREDIT_LIMIT", Some(9)).1, "额度窗口 · unit 9");
+        assert_eq!(window_meta("CREDIT_LIMIT", None).1, "额度窗口");
+
+        // 已知窗口排在新 kind 前面；5 小时档排在周档前。
+        assert!(window_meta("TOKENS_LIMIT", Some(3)).2 < window_meta("CREDIT_LIMIT", Some(3)).2);
+        assert!(window_meta("CREDIT_LIMIT", Some(3)).2 < window_meta("CREDIT_LIMIT", Some(6)).2);
+        // 窗口时长推断与 kind 无关：unit 3 → 5 小时，unit 6 → 7 天。
+        assert_eq!(window_duration_ms("CREDIT_LIMIT", Some(3)), Some(5 * 3_600_000));
+        assert_eq!(
+            window_duration_ms("CREDIT_LIMIT", Some(6)),
+            Some(7 * 24 * 3_600_000)
+        );
     }
 }
