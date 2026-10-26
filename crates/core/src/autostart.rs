@@ -152,58 +152,11 @@ mod imp {
 mod tests {
     use super::*;
 
-    /// 注册表往返：关闭 → 应读不到；开启 → 应读到当前 exe。
-    /// 用例跑完会把用户原来的值原样恢复。
-    #[test]
-    fn registry_roundtrip() {
-        // 备份原值（不存在则为 None）。
-        let original = is_enabled().then(exe_command).flatten();
-
-        assert!(!set_enabled(false), "关闭后应处于未开启状态");
-        assert!(!is_enabled(), "关闭后 is_enabled 应为 false");
-
-        assert!(set_enabled(true), "开启后应处于已开启状态");
-        assert!(is_enabled(), "开启后 is_enabled 应为 true");
-        let current = is_enabled().then(exe_command).flatten();
-        assert!(current.is_some(), "开启后注册表应有值");
-
-        // 恢复原状。
-        if let Some(original) = original {
-            let _ = set_enabled_force(&original);
-        } else {
-            let _ = set_enabled(false);
-        }
-    }
-
-    /// 测试专用：直接写入指定命令（绕过 current_exe，方便恢复现场）。
-    fn set_enabled_force(command: &str) -> bool {
-        use windows_sys::Win32::System::Registry::{
-            HKEY_CURRENT_USER, KEY_WRITE, REG_SZ, RegCloseKey, RegOpenKeyExW, RegSetValueExW,
-        };
-        let path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let name: Vec<u16> = RUN_VALUE.encode_utf16().chain(std::iter::once(0)).collect();
-        let value: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe {
-            let mut key = std::ptr::null_mut();
-            if RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_WRITE, &mut key) != 0 {
-                return false;
-            }
-            let bytes = std::slice::from_raw_parts(value.as_ptr() as *const u8, value.len() * 2);
-            let rc = RegSetValueExW(
-                key,
-                name.as_ptr(),
-                0,
-                REG_SZ,
-                bytes.as_ptr(),
-                bytes.len() as u32,
-            );
-            RegCloseKey(key);
-            rc == 0
-        }
-    }
+    // 注意：这里刻意不写任何动真实注册表的测试（如 set_enabled 往返）。
+    // 单测进程对 Run 项的写入会污染用户真实的开机启动配置，且当注册表
+    // 值指向别的 exe 时（is_enabled 按当前 exe 比对）备份/恢复逻辑会失效，
+    // 历史上曾把用户的启动项改写成测试二进制的路径。注册表行为靠应用
+    // 进程的启动自愈与手工验证。
 
     #[test]
     fn exe_command_is_quoted() {

@@ -69,14 +69,10 @@ impl Manager {
     pub async fn new(data_dir: &Path) -> Self {
         let store = Arc::new(Store::new(data_dir));
         let persisted = store.load().await;
-        // 开机启动自愈：设置项与注册表实际状态不一致时，以设置项为准补齐。
-        // 覆盖三种情况——首次运行（默认开启但注册表还没写过）、用户手动在
-        // 注册表里删过值、exe 挪过位置导致 Run 值指向旧路径（is_enabled
-        // 视为未开启，这里用当前路径重写）。否则界面里勾选状态是假的，
-        // 要手动取消再勾选一次才能真正写进去。
-        if crate::autostart::is_enabled() != persisted.settings.start_with_windows {
-            crate::autostart::set_enabled(persisted.settings.start_with_windows);
-        }
+        // 开机启动的注册表自愈不在库里做：cargo test 的测试二进制也会走
+        // Manager::new，如果在这里写 Run 项，测试进程会把自己的路径写进
+        // 注册表（或按测试设置删掉用户的启动项）。注册表只属于真正的应用
+        // 进程，由界面层（bridge）在启动时自愈。
         let mut runtime = HashMap::new();
         for key in &persisted.keys {
             runtime.insert(
@@ -606,14 +602,8 @@ impl Manager {
     }
 
     pub async fn update_settings(&self, next: Settings) {
-        let autostart_changed = {
-            let current = self.inner.read().await.settings.clone();
-            current.start_with_windows != next.start_with_windows
-        };
-        if autostart_changed {
-            // 设置项即事实：勾上就写 Run 项，取消就删。
-            crate::autostart::set_enabled(next.start_with_windows);
-        }
+        // 注册表写入同样不在库里做（测试会经过这里），由界面层在收到
+        // UpdateSettings 命令时按开关变化写注册表。
         {
             let mut guard = self.inner.write().await;
             guard.settings = next;

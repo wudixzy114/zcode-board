@@ -127,6 +127,14 @@ fn backend_thread(
 
     runtime.block_on(async move {
         let manager = Manager::new(&data_dir).await;
+        // 开机启动自愈放在应用进程里做（不能进 core：cargo test 的测试
+        // 二进制也会构造 Manager，在那里写注册表会把自己的路径写进 Run 项）。
+        // 设置项与注册表不一致时以设置项为准：首次运行、注册表值被手动
+        // 删除、exe 挪过位置（is_enabled 要求值指向当前 exe）都能自愈。
+        let settings = manager.settings().await;
+        if zcode_core::autostart::is_enabled() != settings.start_with_windows {
+            zcode_core::autostart::set_enabled(settings.start_with_windows);
+        }
         zcode_core::scheduler::spawn_background(manager.clone());
         let _ = ready.send(Backend {});
 
@@ -204,6 +212,12 @@ async fn handle_command(
             manager.set_account_muted(&id, muted).await;
         }
         Command::UpdateSettings(settings) => {
+            // 设置项即事实：开关变化时同步注册表（同样只在应用进程做，
+            // core 的 update_settings 保持无副作用，测试可安全调用）。
+            let prev = manager.settings().await;
+            if prev.start_with_windows != settings.start_with_windows {
+                zcode_core::autostart::set_enabled(settings.start_with_windows);
+            }
             manager.update_settings(settings).await;
         }
         Command::TestNotify => {
